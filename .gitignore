@@ -1,0 +1,5 @@
+# Per-machine settings (copy from config.example.psd1)
+config.psd1
+
+# Downloaded ISOs
+.cache/
