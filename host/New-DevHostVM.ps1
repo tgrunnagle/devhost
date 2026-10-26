@@ -26,7 +26,9 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.psd1'),
+    # Default (repo-root config.psd1) is set in the body: Windows PowerShell 5.1 leaves
+    # $PSScriptRoot empty in param defaults when run with -File.
+    [string]$ConfigPath,
     [string]$VMName,
     [string]$IsoUrl,
     [string]$IsoSha256,
@@ -154,7 +156,8 @@ function Resolve-NetAdapter {
 
 # --- Settings and preflight --------------------------------------------------------
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$s = Get-DevHostSettings -ConfigPath $ConfigPath -Overrides $PSBoundParameters
+if (-not $ConfigPath) { $ConfigPath = Join-Path $repoRoot 'config.psd1' }
+$s =Get-DevHostSettings -ConfigPath $ConfigPath -Overrides $PSBoundParameters
 
 if (Get-VM -Name $s.VMName -ErrorAction SilentlyContinue) {
     throw "A VM named '$($s.VMName)' already exists. Remove it or choose another -VMName."
