@@ -92,7 +92,7 @@ Windows:
 .\client\Add-DevHostContext.ps1 -HostName devhost -User alice
 ```
 
-Use the VM's reserved IP instead of `devhost` if the name doesn't resolve on your network. Then:
+Which name reaches the VM depends on your router's DNS: often `devhost.lan` (or `devhost.local`, `devhost.home`) rather than plain `devhost`. Check with `nslookup devhost.lan`, and use the VM's reserved IP if no name resolves reliably. Then:
 
 ```bash
 docker --context devhost ps      # one-off
