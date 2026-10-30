@@ -20,7 +20,7 @@ Developers run `docker`, `docker build` and `docker compose` from their own lapt
 | `guest/add-dev-user.sh` | VM | Gives a developer SSH + Docker access |
 | `client/add-devhost-context.sh` | macOS / Linux laptop | Creates the `devhost` Docker context |
 | `client/Add-DevHostContext.ps1` | Windows laptop | Same, for Windows |
-| `client/devhost-probe.sh` | macOS / Linux laptop | Exits 0 if devhost answers within 5s |
+| `client/devhost-probe.sh` | macOS / Linux laptop | Exits 0 if devhost answers within about 5s |
 | `client/Test-DevHost.ps1` | Windows laptop | Same, for Windows |
 
 ## Requirements
@@ -110,7 +110,7 @@ Host 192.168.1.50
   ControlPersist 10m
 ```
 
-Docker passes its own `-o ConnectTimeout=30` to ssh, which overrides `ConnectTimeout` from this file. A docker call to a VM that doesn't answer can therefore still take up to 30s to fail. Use the probe below to avoid that.
+Docker passes its own `-o ConnectTimeout=30` to ssh, which overrides `ConnectTimeout` from this file. A docker call to a VM that doesn't answer can therefore still take up to 30s to fail, plus any time spent resolving a DNS name. Use the probe below to avoid that.
 
 ### Use devhost only when it's reachable
 
@@ -130,7 +130,7 @@ docker --context devhost ps
 if (C:\path\to\devhost\client\Test-DevHost.ps1) { $env:DOCKER_CONTEXT = 'devhost' }
 ```
 
-`devhost-probe.sh [context]` runs `docker --context devhost version` and exits 0 if the daemon answers, or 1 otherwise. It never takes longer than 5s (set `DEVHOST_PROBE_TIMEOUT` to change that), even without the SSH config above.
+`devhost-probe.sh [context]` runs `docker --context devhost version` and exits 0 if the daemon answers, or 1 otherwise. It gives up after 5 to 6s (set `DEVHOST_PROBE_TIMEOUT` to change the 5), even without the SSH config above.
 
 For Claude Code, a `SessionStart` hook in `.claude/settings.json` can point the session at devhost only when the VM is up. It prints a one-line note for the agent on success and nothing otherwise:
 

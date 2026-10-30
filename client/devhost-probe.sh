@@ -25,7 +25,8 @@ pid=$!
 # count of loop passes doesn't when starting sleep itself is slow.
 SECONDS=0
 while kill -0 "$pid" 2>/dev/null; do
-    if ((SECONDS >= limit)); then
+    # SECONDS counts whole seconds, so ">" waits between limit and limit+1s.
+    if ((SECONDS > limit)); then
         kill -KILL "$pid" 2>/dev/null
         exit 1
     fi
