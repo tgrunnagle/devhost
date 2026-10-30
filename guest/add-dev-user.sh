@@ -57,30 +57,35 @@ fi
 
 uid="$(id -u "$user")"
 home="$(getent passwd "$user" | cut -d: -f6)"
-install -d -m 0700 -o "$user" -g "$user" "$home/.ssh"
-touch "$home/.ssh/authorized_keys"
+
+# Everything under $home is written as the user, never as root: the user controls that
+# directory, and a symlink planted there would otherwise redirect root's writes.
+as_owner() {
+    (cd "$home" && runuser -u "$user" -- "$@")
+}
+
+as_owner install -d -m 0700 "$home/.ssh"
+as_owner touch "$home/.ssh/authorized_keys"
 
 key="$(cat "$keyfile")"
-if grep -qxF "$key" "$home/.ssh/authorized_keys"; then
+if as_owner grep -qxF "$key" "$home/.ssh/authorized_keys"; then
     echo "==> Key already authorized"
 else
-    echo "$key" >> "$home/.ssh/authorized_keys"
+    printf '%s\n' "$key" | as_owner tee -a "$home/.ssh/authorized_keys" >/dev/null
     echo "==> Key added"
 fi
-chown "$user:$user" "$home/.ssh/authorized_keys"
-chmod 0600 "$home/.ssh/authorized_keys"
+as_owner chmod 0600 "$home/.ssh/authorized_keys"
 
 # Rewrites ~/.ssh/environment without any DOCKER_HOST line, then appends $1 if given.
 set_ssh_docker_host() {
-    local envfile="$home/.ssh/environment"
-    touch "$envfile"
-    grep -v '^DOCKER_HOST=' "$envfile" > "$envfile.tmp" || true
-    if [[ -n "${1:-}" ]]; then
-        echo "DOCKER_HOST=$1" >> "$envfile.tmp"
-    fi
-    mv "$envfile.tmp" "$envfile"
-    chown "$user:$user" "$envfile"
-    chmod 0600 "$envfile"
+    # shellcheck disable=SC2016  # expanded by the inner sh, not here
+    as_owner sh -c '
+        f="$1"
+        touch "$f"
+        { grep -v "^DOCKER_HOST=" "$f" || true; [ -z "$2" ] || echo "DOCKER_HOST=$2"; } > "$f.tmp"
+        mv "$f.tmp" "$f"
+        chmod 0600 "$f"
+    ' sh "$home/.ssh/environment" "${1:-}"
 }
 
 # Gives the user subordinate UID/GID ranges (65536 IDs) if they don't have them yet.
@@ -114,11 +119,13 @@ if $shared; then
     echo "==> $user uses the shared daemon (docker group)"
     if [[ -f "$home/.config/systemd/user/docker.service" ]]; then
         # Stop it so its containers don't keep holding ports nobody can reach any more.
-        if [[ -S "/run/user/$uid/bus" ]]; then
-            as_user systemctl --user disable --now docker.service || true
+        if [[ -S "/run/user/$uid/bus" ]] && as_user systemctl --user disable --now docker.service; then
+            echo "    Stopped their rootless daemon. Its images and volumes are kept in"
+            echo "    $home/.local/share/docker; re-run without --shared to switch back."
+        else
+            echo "    Warning: couldn't stop their rootless daemon. As $user, run:"
+            echo "    systemctl --user disable --now docker.service"
         fi
-        echo "    Stopped their rootless daemon. Its images and volumes are kept in"
-        echo "    $home/.local/share/docker; re-run without --shared to switch back."
     fi
 else
     if id -nG "$user" | tr ' ' '\n' | grep -qx docker; then
@@ -155,15 +162,14 @@ else
     # Rootless daemons don't read /etc/docker/daemon.json; give each the same log rotation.
     config_dir="$home/.config/docker"
     restart_daemon=false
-    if [[ ! -f "$config_dir/daemon.json" ]]; then
-        runuser -u "$user" -- mkdir -p "$config_dir"
-        cat > "$config_dir/daemon.json" <<'EOF'
+    if ! as_owner test -e "$config_dir/daemon.json"; then
+        as_owner mkdir -p "$config_dir"
+        as_owner tee "$config_dir/daemon.json" >/dev/null <<'EOF'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 EOF
-        chown "$user:$user" "$config_dir/daemon.json"
         restart_daemon=true
     fi
 
