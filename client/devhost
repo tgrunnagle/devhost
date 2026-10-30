@@ -24,6 +24,7 @@
 #   DEVHOST_STATE_DIR      state directory (default: ~/.devhost)
 #   DEVHOST_NO_SYNC=1      mirror ports only, skip the Mutagen sync
 #   DEVHOST_FLUSH_TIMEOUT  seconds to wait for a sync flush (default: 60)
+#   DEVHOST_SYNC_TIMEOUT   seconds to wait for a new session's initial sync (default: 600)
 #   DEVHOST_CONFLICTS      what a port that can't be mirrored does to `run`:
 #                          auto (default) fails it only for containers that
 #                          appeared while the command ran; fail: any conflict
@@ -35,6 +36,7 @@
 CONTEXT="${DEVHOST_CONTEXT:-devhost}"
 STATE_DIR="${DEVHOST_STATE_DIR:-$HOME/.devhost}"
 FLUSH_TIMEOUT="${DEVHOST_FLUSH_TIMEOUT:-60}"
+SYNC_TIMEOUT="${DEVHOST_SYNC_TIMEOUT:-600}"
 CONFLICT_MODE="${DEVHOST_CONFLICTS:-auto}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -753,7 +755,8 @@ check_conflict_mode() {
 
 sync_enabled() { [[ "${DEVHOST_NO_SYNC:-0}" != 1 ]]; }
 
-sync_name() { echo "devhost-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"; }
+sync_name_for() { echo "devhost-$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
+sync_name() { sync_name_for "$PWD"; }
 
 # Prints ignore patterns, one per line: .devhostignore if present, else defaults.
 sync_ignore_patterns() {
@@ -795,9 +798,76 @@ ensure_remote_dir() {
     fi
 }
 
+# Laptop paths of every devhost sync session Mutagen knows about.
+devhost_sync_alphas() {
+    mutagen sync list --label-selector devhost=1 2>/dev/null |
+        awk '/^Alpha:/ { a = 1; next } a && $1 == "URL:" { print $2; a = 0 }' || true
+}
+
+# Two sessions over the same files would fight: refuse when another devhost
+# session already covers $PWD (a checkout that is up, run from one of its
+# subdirectories) or lies inside it.
+check_no_overlapping_sync() {
+    local alpha
+    while read -r alpha; do
+        [[ -n "$alpha" && "$alpha" != "$PWD" ]] || continue
+        if [[ "$PWD" == "$alpha"/* ]]; then
+            log "$PWD is inside $alpha, which another devhost session already syncs."
+            log "run from $alpha (its sync covers this directory), or 'devhost down' there first."
+            return 1
+        fi
+        if [[ "$alpha" == "$PWD"/* ]]; then
+            log "$alpha, inside this checkout, is already synced by another devhost session."
+            log "'devhost down' there first: one session must cover a tree."
+            return 1
+        fi
+    done < <(devhost_sync_alphas)
+}
+
+# Terminates sync session $1 if it exists.
+terminate_sync_named() {
+    mutagen sync list "$1" >/dev/null 2>&1 || return 0
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate "$1" >/dev/null 2>&1 ||
+        log "warning: mutagen sync terminate $1 failed or timed out"
+}
+
+# Warns about files Mutagen cannot update in session $1.
+warn_sync_problems() {
+    local status
+    status="$(mutagen sync list "$1" 2>/dev/null || true)"
+    if grep -qi 'permission denied' <<< "$status"; then
+        log "warning: sync reports permission problems. A container probably ran as root and left"
+        log "root-owned files on the VM, which Mutagen cannot update or delete. See README."
+    fi
+}
+
+# Makes the VM copy match the laptop before the two-way session starts. A
+# two-way session with no history treats files that exist only on the VM
+# (deleted here since the last session, another branch's files, old outputs)
+# as new and would copy them back into the checkout. A one-way replica,
+# flushed once and dropped, removes them instead. $1: session name; the rest:
+# ignore arguments.
+prime_sync() {
+    local name="$1" rc=0
+    shift
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name-prime" --label devhost=1 \
+        --sync-mode one-way-replica "$@" "$PWD" "$(sync_beta_url)" >/dev/null || {
+        log "mutagen sync create (priming the VM copy) failed or timed out"
+        return 1
+    }
+    with_deadline "$SYNC_TIMEOUT" mutagen sync flush "$name-prime" >/dev/null 2>&1 || rc=$?
+    terminate_sync_named "$name-prime"
+    if [[ $rc -eq 124 ]]; then
+        log "initial sync of $PWD did not finish within ${SYNC_TIMEOUT}s (DEVHOST_SYNC_TIMEOUT)"
+        return 1
+    elif [[ $rc -ne 0 ]]; then
+        log "warning: priming the VM copy reported problems (devhost status for details)"
+    fi
+}
+
 # Returns 1 (after logging) when the sync can't be set up.
 start_sync() {
-    local name pattern ignore_args=()
+    local name pattern ignore_args=() rc=0
     sync_enabled || return 0
     if ! mutagen_available; then
         log "mutagen not found. Install it (https://mutagen.io) or set DEVHOST_NO_SYNC=1 for ports only."
@@ -808,43 +878,48 @@ start_sync() {
         return 0
     fi
     ensure_remote_dir || return 1
+    check_no_overlapping_sync || return 1
     while read -r pattern; do
         ignore_args+=(--ignore "$pattern")
     done < <(sync_ignore_patterns)
     log "syncing $PWD -> $TARGET:$PWD"
     # ${arr[@]+...}: bash 3.2 treats an empty array as unbound under set -u.
+    prime_sync "$name" ${ignore_args[@]+"${ignore_args[@]}"} || return 1
     with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name" --label devhost=1 --sync-mode two-way-resolved \
         ${ignore_args[@]+"${ignore_args[@]}"} "$PWD" "$(sync_beta_url)" >/dev/null || {
         log "mutagen sync create failed or timed out"
         return 1
     }
+    # The first flush covers the initial scan of both sides; give it longer.
+    with_deadline "$SYNC_TIMEOUT" mutagen sync flush "$name" >/dev/null 2>&1 || rc=$?
+    if [[ $rc -eq 124 ]]; then
+        log "initial sync of $PWD did not finish within ${SYNC_TIMEOUT}s (DEVHOST_SYNC_TIMEOUT)"
+        terminate_sync_named "$name"
+        return 1
+    fi
+    warn_sync_problems "$name"
 }
 
-# Waits for the sync to settle; warns about files Mutagen cannot update.
+# Waits for the sync to settle. Returns 124 on timeout, non-zero on failure,
+# after saying why; the caller decides whether that is fatal.
 flush_sync() {
-    local name status rc=0
+    local name rc=0
     sync_enabled || return 0
     name="$(sync_name)"
     sync_exists || return 0
     with_deadline "$FLUSH_TIMEOUT" mutagen sync flush "$name" >/dev/null 2>&1 || rc=$?
     if [[ $rc -eq 124 ]]; then
-        log "warning: sync flush did not finish within ${FLUSH_TIMEOUT}s; outputs may be stale"
+        log "sync flush did not finish within ${FLUSH_TIMEOUT}s (DEVHOST_FLUSH_TIMEOUT)"
     elif [[ $rc -ne 0 ]]; then
-        log "warning: mutagen sync flush failed; outputs may be stale (devhost status for details)"
+        log "mutagen sync flush failed (devhost status for details)"
     fi
-    status="$(mutagen sync list "$name" 2>/dev/null || true)"
-    if grep -qi 'permission denied' <<< "$status"; then
-        log "warning: sync reports permission problems. A container probably ran as root and left"
-        log "root-owned files on the VM, which Mutagen cannot update or delete. See README."
-    fi
+    warn_sync_problems "$name"
+    return $rc
 }
 
 stop_sync() {
     sync_enabled || return 0
-    if sync_exists; then
-        with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate "$(sync_name)" >/dev/null 2>&1 ||
-            log "warning: mutagen sync terminate failed or timed out"
-    fi
+    terminate_sync_named "$(sync_name)"
 }
 
 # --------------------------------------------------------------- sessions
@@ -900,14 +975,19 @@ session_active() {
     return 1
 }
 
-# Drops "run" sessions whose runs are all dead (leftovers from a crash).
-# Caller holds the lock.
+# Drops "run" sessions whose runs are all dead (leftovers from a crash),
+# with their sync, which would otherwise keep running unseen. Caller holds
+# the lock.
 prune_sessions() {
-    local f
+    local f path
     for f in "$SESSIONS_DIR"/*; do
         [[ -f "$f" ]] || continue
         if [[ "$(sed -n '2p' "$f")" == run ]] && ! runs_alive_in "${f}.runs"; then
+            path="$(sed -n '1p' "$f")"
             rm -rf "$f" "${f}.runs"
+            if sync_enabled && mutagen_available && [[ -n "$path" ]]; then
+                terminate_sync_named "$(sync_name_for "$path")"
+            fi
         fi
     done
 }
@@ -964,7 +1044,7 @@ session_start() {
 # Stops the session for $PWD; the forwarder and master go when no directory
 # is left. Caller holds the lock.
 session_stop() {
-    flush_sync
+    flush_sync || log "warning: outputs may be stale on the laptop"
     stop_sync
     unregister_session
     prune_sessions
@@ -972,6 +1052,10 @@ session_stop() {
         stop_forwarder
         stop_master
         rm -f "$FORWARDS_FILE" "$CONFLICTS_FILE"
+        # No directory is up, so any devhost sync Mutagen still has is a leftover.
+        if sync_enabled && mutagen_available; then
+            with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate --label-selector devhost=1 >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -1056,7 +1140,7 @@ cmd_flush() {
     init_state
     resolve_target
     session_registered || die "$PWD is not up (run: devhost up)"
-    flush_sync
+    flush_sync || die "flush failed: local changes or outputs may not have been synced"
     log "flushed"
     check_conflicts
 }
@@ -1153,7 +1237,8 @@ run_cleanup() {
         lock_release
     else
         lock_release
-        flush_sync     # outside the lock: it can take a while
+        # Outside the lock: it can take a while. Outputs are best effort here.
+        flush_sync || log "warning: outputs may be stale on the laptop"
     fi
 }
 
@@ -1182,7 +1267,8 @@ cmd_run() {
     lock_release
     pre="$STATE_DIR/conflicts.pre.$$"
     precheck_conflicts "$pre" || exit 1
-    flush_sync
+    # The command must not run against a half-synced checkout on the VM.
+    flush_sync || { log "not running the command: the checkout is not fully synced"; exit 1; }
     # Run the command as a background job and wait for it, so signals reach
     # this shell while it runs (a foreground child would hold them until it
     # exits); <&0 keeps the command's stdin, which `&` would otherwise drop.
@@ -1211,7 +1297,7 @@ cmd_run() {
 }
 
 cmd_status() {
-    local port addr cid name reason f
+    local port addr cid name reason f others
     init_state
     resolve_target
     if [[ -s "$CONFLICTS_FILE" ]]; then
@@ -1261,6 +1347,11 @@ cmd_status() {
         else
             echo "sync:       none for $PWD"
         fi
+        others="$(devhost_sync_alphas | grep -vx -- "$PWD" || true)"
+        if [[ -n "$others" ]]; then
+            echo "other devhost syncs (leftovers, unless their directory is up):"
+            echo "  ${others//$'\n'/$'\n'  }"
+        fi
     fi
 }
 
@@ -1273,6 +1364,9 @@ main() {
     set -euo pipefail
     local cmd="${1:-}"
     [[ $# -gt 0 ]] && shift
+    # Sessions and syncs are keyed by the physical path, so a checkout reached
+    # through a symlink (macOS /tmp -> /private/tmp) is the same checkout.
+    cd -P . 2>/dev/null || true
     case "$cmd" in
         run)        cmd_run "$@" ;;
         up)         cmd_up ;;

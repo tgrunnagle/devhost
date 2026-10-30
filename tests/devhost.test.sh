@@ -356,7 +356,7 @@ test_concurrent_runs_share_one_session() {
     assert_eq "$rc2" "0" "second run exits 0"
     assert_exists "$FAKE_DIR/master" "master survives the second run finishing first"
     assert_exists "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder survives"
-    assert_file_lacks "$FAKE_DIR/mutagen.log" "sync terminate" "sync survives"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "devhost-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)" "sync survives"
     touch "$FAKE_DIR/run1-go"
     wait "$pid1" || rc1=$?
     assert_eq "$rc1" "0" "first run exits 0"
@@ -465,7 +465,9 @@ test_run_passes_exit_code_and_sets_context() {
     run_devhost run -- sh -c 'echo "$DOCKER_CONTEXT" > ctx; exit 3' 2>"$TMP/stderr" || rc=$?
     assert_eq "$rc" "3" "child exit code passed through"
     assert_eq "$(cat ctx)" "devhost" "DOCKER_CONTEXT set for the child"
-    assert_eq "$(grep -c 'sync flush' "$FAKE_DIR/mutagen.log")" "2" "flushed before and after, even on failure"
+    local name
+    name="devhost-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    assert_eq "$(grep -c -- "sync flush $name\$" "$FAKE_DIR/mutagen.log")" "3" "flushed at creation, before and after, even on failure"
     assert_file_lacks "$TMP/stderr" "warning:" "no warnings on the happy path"
     assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate" "sync removed"
     assert_file_has "$FAKE_DIR/ssh.log" "-M -N -f -S $DEVHOST_STATE_DIR/ssh.sock alice@devhost" "master opened"
@@ -714,12 +716,101 @@ test_flush_has_a_deadline() {
     load
     start_sync 2>/dev/null
     touch "$FAKE_DIR/mutagen-flush-hang"
-    local out start end
+    local out start end rc=0
     start=$(date +%s)
-    out="$(DEVHOST_FLUSH_TIMEOUT=1 FLUSH_TIMEOUT=1 flush_sync 2>&1)"
+    out="$(FLUSH_TIMEOUT=1 flush_sync 2>&1)" || rc=$?
     end=$(date +%s)
     [[ $((end - start)) -le 3 ]] || fail "flush returned after $((end - start))s"
-    [[ "$out" == *"did not finish within 1s"* ]] || fail "timeout warning: $out"
+    assert_eq "$rc" "124" "flush_sync reports the timeout"
+    [[ "$out" == *"did not finish within 1s"* ]] || fail "timeout message: $out"
+}
+
+test_sync_primes_vm_from_laptop_first() {
+    load
+    start_sync 2>/dev/null
+    local name l1 l2 l3 l4 l5
+    name="$(sync_name)"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync create --name $name-prime --label devhost=1 --sync-mode one-way-replica --ignore node_modules --ignore .git --ignore .venv --ignore target --ignore dist $PWD alice@devhost:$PWD" "one-way replica from the laptop, same ignores"
+    l1="$(grep -n -- "sync create --name $name-prime" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
+    l2="$(grep -n -- "sync flush $name-prime" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
+    l3="$(grep -n -- "sync terminate $name-prime" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
+    l4="$(grep -n -- "sync create --name $name --label" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
+    l5="$(grep -n -- "sync flush $name\$" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
+    [[ -n "$l1" && -n "$l2" && -n "$l3" && -n "$l4" && -n "$l5" && $l1 -lt $l2 && $l2 -lt $l3 && $l3 -lt $l4 && $l4 -lt $l5 ]] ||
+        fail "replica created, flushed and dropped before the two-way session is created and flushed: $(cat "$FAKE_DIR/mutagen.log")"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "$name" "only the two-way session remains"
+}
+
+test_initial_sync_timeout_fails_up() {
+    : > "$FAKE_DIR/ps"
+    touch "$FAKE_DIR/mutagen-flush-hang"
+    local out rc=0
+    out="$(DEVHOST_SYNC_TIMEOUT=1 run_devhost up 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "up fails when the initial sync doesn't finish"
+    [[ "$out" == *"did not finish within 1s"*"DEVHOST_SYNC_TIMEOUT"* ]] || fail "says why: $out"
+    assert_missing "$FAKE_DIR/master" "torn down"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "no session left behind"
+}
+
+test_flush_failure_is_fatal_for_flush_and_before_run() {
+    : > "$FAKE_DIR/ps"
+    run_devhost up 2>/dev/null || fail "up"
+    touch "$FAKE_DIR/mutagen-flush-hang"
+    local rc=0
+    DEVHOST_FLUSH_TIMEOUT=1 run_devhost flush 2>/dev/null || rc=$?
+    assert_eq "$rc" "1" "devhost flush exits 1 when the flush times out"
+    rc=0
+    DEVHOST_FLUSH_TIMEOUT=1 run_devhost run -- sh -c 'echo ran > ran' 2>/dev/null || rc=$?
+    assert_eq "$rc" "1" "run refuses when the pre-command flush fails"
+    assert_missing ran "command not run on a stale sync"
+    rm -f "$FAKE_DIR/mutagen-flush-hang"
+    run_devhost down 2>/dev/null || fail "down"
+}
+
+test_prune_terminates_crashed_runs_sync() {
+    : > "$FAKE_DIR/ps"
+    mkdir -p "$DEVHOST_STATE_DIR/sessions"
+    printf '%s\nrun\n' "$TMP/crashed" > "$DEVHOST_STATE_DIR/sessions/123456"   # crashed run, no live pids
+    local crashed_sync
+    crashed_sync="devhost-$(printf '%s' "$TMP/crashed" | cksum | cut -d' ' -f1)"
+    echo "$crashed_sync" > "$FAKE_DIR/mutagen-sessions"
+    echo "$crashed_sync $TMP/crashed" > "$FAKE_DIR/mutagen-alphas"
+    run_devhost run -- true 2>/dev/null || fail "run"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate $crashed_sync" "the crashed run's sync went with its session"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "no sync left behind"
+}
+
+test_last_down_terminates_leftover_syncs() {
+    : > "$FAKE_DIR/ps"
+    echo "devhost-leftover" > "$FAKE_DIR/mutagen-sessions"
+    echo "devhost-leftover $TMP/old-checkout" > "$FAKE_DIR/mutagen-alphas"
+    run_devhost up 2>/dev/null || fail "up"
+    local status
+    status="$(run_devhost status 2>/dev/null)"
+    [[ "$status" == *"other devhost syncs"*"$TMP/old-checkout"* ]] || fail "status lists other devhost syncs: $status"
+    run_devhost down 2>/dev/null || fail "down"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate --label-selector devhost=1" "leftovers go with the last session"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "no devhost sync left"
+}
+
+test_nested_checkout_is_refused() {
+    load
+    echo "devhost-parent" > "$FAKE_DIR/mutagen-sessions"
+    echo "devhost-parent $PWD" > "$FAKE_DIR/mutagen-alphas"    # the checkout root is up
+    mkdir -p sub
+    cd sub || exit 1
+    local out rc=0
+    out="$(start_sync 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "a session inside a synced checkout is refused"
+    [[ "$out" == *"inside $PROJECT"* ]] || fail "names the covering session: $out"
+    assert_file_lacks "$FAKE_DIR/mutagen.log" "sync create" "no second session created"
+    cd "$PROJECT" || exit 1
+    echo "devhost-child $PROJECT/sub" > "$FAKE_DIR/mutagen-alphas"   # or a subdirectory is
+    echo "devhost-child" > "$FAKE_DIR/mutagen-sessions"
+    rc=0
+    out="$(start_sync 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "a session over a synced subdirectory is refused"
+    [[ "$out" == *"$PROJECT/sub"*"inside this checkout"* ]] || fail "names the inner session: $out"
 }
 
 test_run_with_sync_disabled() {
@@ -741,7 +832,7 @@ test_up_down_lifecycle() {
     # A run inside an active session reuses it and leaves it up.
     run_devhost run -- true 2>/dev/null || fail "nested run"
     assert_exists "$FAKE_DIR/master" "nested run keeps master"
-    assert_file_lacks "$FAKE_DIR/mutagen.log" "sync terminate" "nested run keeps sync"
+    assert_eq "$(grep -c -- "sync terminate $(cat "$FAKE_DIR/mutagen-sessions")\$" "$FAKE_DIR/mutagen.log")" "0" "nested run keeps sync"
     run_devhost flush 2>/dev/null || fail "flush"
     run_devhost down 2>/dev/null || fail "down"
     assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder stopped"
