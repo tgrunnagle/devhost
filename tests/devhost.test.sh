@@ -65,9 +65,11 @@ test_parse_published_ports() {
 80/tcp -> [::]:49153
 53/udp -> 0.0.0.0:5353
 443/tcp -> 127.0.0.1:8443
+8080/tcp -> 192.168.1.5:8080
 EOF
 )"
-    assert_eq "$out" "$(printf '6379\n8443\n49153')" "tcp host ports, deduped, udp skipped"
+    assert_eq "$out" "$(printf '6379 127.0.0.1\n8080 192.168.1.5\n8443 127.0.0.1\n49153 127.0.0.1')" \
+        "tcp host ports with the VM-side address, deduped, udp skipped"
     out="$(parse_published_ports <<< "")"
     assert_eq "$out" "" "no ports"
 }
@@ -163,6 +165,105 @@ test_forward_binds_loopback_only() {
     assert_file_has "$FAKE_DIR/ssh.log" "-L 127.0.0.1:8080:127.0.0.1:8080" "laptop side bound to 127.0.0.1"
     assert_file_lacks "$FAKE_DIR/ssh.log" "-L 8080:" "never an unbound -L"
     assert_file_lacks "$FAKE_DIR/ssh.log" "0.0.0.0:8080:" "never bound to all interfaces"
+    echo "80/tcp -> 192.168.1.5:8081" > "$FAKE_DIR/port.cccc00000002"
+    handle_event start cccc00000002 lanonly 2>/dev/null
+    assert_file_has "$FAKE_DIR/ssh.log" "-L 127.0.0.1:8081:192.168.1.5:8081" "a port on a specific VM interface is reached there"
+}
+
+test_conflicts_are_cleared_and_deduped() {
+    load
+    echo "6379 redis-server 9999" > "$FAKE_DIR/busy-ports"
+    printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
+    echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
+    reconcile 2>/dev/null
+    reconcile 2>/dev/null
+    handle_event start abc123def456 redis 2>/dev/null
+    assert_eq "$(grep -c '^' "$CONFLICTS_FILE")" "1" "one line per port+container"
+    handle_event die abc123def456 redis 2>/dev/null
+    assert_eq "$(cat "$CONFLICTS_FILE")" "" "die clears the conflict"
+    reconcile 2>/dev/null
+    : > "$FAKE_DIR/ps"
+    reconcile 2>/dev/null
+    assert_eq "$(cat "$CONFLICTS_FILE")" "" "reconcile drops conflicts of containers no longer running"
+    printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
+    reconcile 2>/dev/null
+    assert_eq "$(grep -c '^' "$CONFLICTS_FILE")" "1" "conflict back while the port is busy"
+    rm -f "$FAKE_DIR/busy-ports"
+    reconcile 2>/dev/null
+    assert_eq "$(cat "$CONFLICTS_FILE")" "" "forwarded once the port is free, conflict cleared"
+    assert_file_has "$FORWARDS_FILE" "6379 abc123def456 redis" "forward recorded"
+}
+
+test_nested_run_reports_conflict() {
+    : > "$FAKE_DIR/ps"
+    run_devhost up 2>/dev/null || fail "up"
+    echo "6379|abc123def456|redis|port already in use on this laptop by redis-server (pid 9999)" >> "$DEVHOST_STATE_DIR/conflicts"
+    local out rc=0
+    out="$(run_devhost run -- sh -c 'echo ran > ran' 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "nested run refuses"
+    assert_missing ran "command not run"
+    [[ "$out" == *"127.0.0.1:6379"*"redis-server (pid 9999)"* ]] || fail "nested run says why: $out"
+    run_devhost down 2>/dev/null || fail "down"
+}
+
+test_concurrent_runs_share_one_session() {
+    : > "$FAKE_DIR/ps"
+    local rc1=0 rc2=0 pid1
+    run_devhost run -- sleep 6 2>/dev/null &
+    pid1=$!
+    sleep 2
+    run_devhost run -- sleep 1 2>/dev/null || rc2=$?
+    assert_eq "$rc2" "0" "second run exits 0"
+    assert_exists "$FAKE_DIR/master" "master survives the second run finishing first"
+    assert_exists "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder survives"
+    assert_file_lacks "$FAKE_DIR/mutagen.log" "sync terminate" "sync survives"
+    wait "$pid1" || rc1=$?
+    assert_eq "$rc1" "0" "first run exits 0"
+    assert_missing "$FAKE_DIR/master" "last run out tears down"
+    assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder stopped"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate" "sync terminated by the last run"
+    assert_eq "$(grep -c -- '-M -N -f' "$FAKE_DIR/ssh.log")" "1" "only one master was ever opened"
+}
+
+test_up_during_run_keeps_session_after_run() {
+    : > "$FAKE_DIR/ps"
+    local pid1
+    run_devhost run -- sleep 4 2>/dev/null &
+    pid1=$!
+    sleep 2
+    run_devhost up 2>/dev/null || fail "up while a run is active"
+    wait "$pid1" || fail "run"
+    assert_exists "$FAKE_DIR/master" "explicit up outlives the run that started the session"
+    run_devhost down 2>/dev/null || fail "down"
+    assert_missing "$FAKE_DIR/master" "down stops it"
+}
+
+test_stale_run_session_elsewhere_does_not_keep_forwarder() {
+    : > "$FAKE_DIR/ps"
+    mkdir -p "$DEVHOST_STATE_DIR/sessions"
+    printf '%s\nrun\n' "$TMP/crashed" > "$DEVHOST_STATE_DIR/sessions/123456"   # crashed run, no live pids
+    run_devhost run -- true 2>/dev/null || fail "run"
+    assert_missing "$FAKE_DIR/master" "stale run session elsewhere was pruned"
+    assert_missing "$DEVHOST_STATE_DIR/sessions/123456" "stale file removed"
+}
+
+test_down_terminates_sync_without_session_file() {
+    load
+    start_sync 2>/dev/null
+    run_devhost down 2>/dev/null || fail "down"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate $(sync_name)" "sync terminated even though no session file existed"
+}
+
+test_forwarder_failing_at_start_tears_down() {
+    : > "$FAKE_DIR/ps"
+    touch "$FAKE_DIR/ps-fail"
+    local out rc=0
+    out="$(run_devhost up 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "up fails"
+    [[ "$out" == *"forwarder failed to start"* ]] || fail "reason given: $out"
+    assert_missing "$FAKE_DIR/master" "master torn down"
+    assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "no pid file"
+    assert_missing "$DEVHOST_STATE_DIR/forwarder.ready" "no ready file"
 }
 
 test_ignore_patterns() {
@@ -285,8 +386,9 @@ test_forwarder_reconnects_when_stream_ends() {
     printf 'start eeee00000001 nginx\n' > "$FAKE_DIR/events"
     echo 0 > "$FAKE_DIR/events-hold"               # stream ends right after the event
     run_devhost up 2>/dev/null || fail "up"
-    # Reconnect waits 1s, then re-reconciles and re-follows; allow for slow process spawning.
-    sleep 6
+    # Reconnect backs off 2s, then reconciles (ps is empty, so the forward goes)
+    # and re-follows (the start event adds it again); allow for slow process spawning.
+    sleep 10
     [[ "$(grep -c -- '-O forward -L 127.0.0.1:48082:' "$FAKE_DIR/ssh.log")" -ge 2 ]] ||
         fail "forward re-established after the stream ended; forwarder log:
 $(cat "$DEVHOST_STATE_DIR/forwarder.log")"

@@ -34,12 +34,13 @@ FLUSH_TIMEOUT="${DEVHOST_FLUSH_TIMEOUT:-60}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 SOCK="$STATE_DIR/ssh.sock"
+LOCK_DIR="$STATE_DIR/lock"                 # mkdir lock around state transitions
 FORWARDS_FILE="$STATE_DIR/forwards"        # lines: PORT CONTAINER_ID NAME
 CONFLICTS_FILE="$STATE_DIR/conflicts"      # lines: PORT|CONTAINER_ID|NAME|REASON
 FWD_PID_FILE="$STATE_DIR/forwarder.pid"
 FWD_READY_FILE="$STATE_DIR/forwarder.ready"
 FWD_LOG="$STATE_DIR/forwarder.log"
-SESSIONS_DIR="$STATE_DIR/sessions"         # one file per directory that is "up"
+SESSIONS_DIR="$STATE_DIR/sessions"         # <id>: "PWD\nMODE" (up|run); <id>.runs/<pid>
 
 DEFAULT_IGNORES="node_modules .git .venv target dist"
 
@@ -56,9 +57,7 @@ die() { log "$@"; exit 1; }
 # the developer during `up`. Silently does nothing without a terminal.
 notify() {
     log "$@"
-    if [[ -w /dev/tty ]]; then
-        printf 'devhost: %s\n' "$*" > /dev/tty 2>/dev/null || true
-    fi
+    { printf 'devhost: %s\n' "$*" > /dev/tty; } 2>/dev/null || true
 }
 
 init_state() {
@@ -104,6 +103,34 @@ kill_tree() {
 }
 
 pid_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+
+# Serialises up/down across concurrent invocations (mkdir is atomic; macOS has
+# no flock). Re-entrant for the holding process; a dead holder's lock is removed.
+lock_acquire() {
+    local ticks=0 owner
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        if [[ "$owner" == "$$" ]]; then
+            return 0
+        fi
+        if [[ -n "$owner" ]] && ! pid_alive "$owner"; then
+            rm -rf "$LOCK_DIR"
+            continue
+        fi
+        if [[ $ticks -ge 1200 ]]; then
+            die "another devhost command has held $LOCK_DIR for 2 minutes; remove it if nothing is running"
+        fi
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+    echo "$$" > "$LOCK_DIR/pid"
+}
+
+lock_release() {
+    if [[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" == "$$" ]]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
 
 # -------------------------------------------------------------- ssh target
 
@@ -178,17 +205,25 @@ daemon_reachable() {
 
 # ----------------------------------------------------------- port parsing
 
-# stdin: output of `docker port <id>`; stdout: host TCP ports, one per line,
-# deduplicated. UDP can't go through an SSH forward and is skipped.
+# stdin: output of `docker port <id>`; stdout: "PORT ADDR" per host TCP port,
+# deduplicated on PORT. ADDR is where to connect on the VM: the VM's loopback
+# for wildcard/loopback bindings, otherwise the specific interface address.
+# UDP can't go through an SSH forward and is skipped.
 parse_published_ports() {
-    local cport arrow addr port
+    local cport arrow addr port host
     while read -r cport arrow addr; do
         [[ "$arrow" == '->' ]] || continue
         [[ "$cport" == */tcp ]] || continue
         port="${addr##*:}"
         [[ "$port" =~ ^[0-9]+$ ]] || continue
-        echo "$port"
-    done | sort -un
+        host="${addr%:*}"
+        host="${host#[}"
+        host="${host%]}"
+        case "$host" in
+            0.0.0.0|::|127.0.0.1|::1|'') host=127.0.0.1 ;;
+        esac
+        echo "$port $host"
+    done | sort -un -k1,1
 }
 
 # Prints what listens on 127.0.0.1:$1 on the laptop ("COMMAND (pid N)"), or
@@ -230,17 +265,35 @@ forward_ports_for() {  # prints forwarded ports of container $1 (ID prefix match
     awk -v cid="$1" 'index($2, cid) == 1 || index(cid, $2) == 1 { print $1 }' "$FORWARDS_FILE"
 }
 
+# A conflict is remembered once per port+container and forgotten when the
+# container dies, is no longer running, or the port gets forwarded after all.
 record_conflict() {
     local port="$1" cid="$2" name="$3" reason="$4"
+    if [[ -f "$CONFLICTS_FILE" ]] && grep -q "^$port|$cid|" "$CONFLICTS_FILE"; then
+        return 0
+    fi
     echo "$port|$cid|$name|$reason" >> "$CONFLICTS_FILE"
     notify "CONFLICT: 127.0.0.1:$port for container $name (${cid:0:12}) not forwarded: $reason"
 }
 
-# Mirrors 127.0.0.1:PORT on the laptop to 127.0.0.1:PORT on the VM.
+clear_conflicts_for_port() {
+    [[ -f "$CONFLICTS_FILE" ]] || return 0
+    grep -v "^$1|" "$CONFLICTS_FILE" > "$CONFLICTS_FILE.tmp" || true
+    mv "$CONFLICTS_FILE.tmp" "$CONFLICTS_FILE"
+}
+
+clear_conflicts_for_container() {  # ID prefix match, like forward_ports_for
+    [[ -f "$CONFLICTS_FILE" ]] || return 0
+    awk -F'|' -v cid="$1" '!(index($2, cid) == 1 || index(cid, $2) == 1)' "$CONFLICTS_FILE" > "$CONFLICTS_FILE.tmp" || true
+    mv "$CONFLICTS_FILE.tmp" "$CONFLICTS_FILE"
+}
+
+# Mirrors 127.0.0.1:PORT on the laptop to ADDR:PORT on the VM.
 add_forward() {
-    local port="$1" cid="$2" name="$3" holder mpid
+    local port="$1" addr="$2" cid="$3" name="$4" holder mpid
     if forward_exists "$port"; then
         forward_record "$port" "$cid" "$name"
+        clear_conflicts_for_port "$port"
         return 0
     fi
     holder="$(port_holder "$port")"
@@ -249,6 +302,7 @@ add_forward() {
         mpid="$(master_pid)"
         if [[ -n "$mpid" && "$holder" == *"(pid $mpid)" ]]; then
             forward_record "$port" "$cid" "$name"
+            clear_conflicts_for_port "$port"
             return 0
         fi
         record_conflict "$port" "$cid" "$name" "port already in use on this laptop by $holder"
@@ -258,8 +312,9 @@ add_forward() {
         record_conflict "$port" "$cid" "$name" "port already in use on this laptop (listener unknown)"
         return 1
     fi
-    if mux_ssh -O forward -L "127.0.0.1:$port:127.0.0.1:$port" "$TARGET" >/dev/null 2>&1; then
+    if mux_ssh -O forward -L "127.0.0.1:$port:$addr:$port" "$TARGET" >/dev/null 2>&1; then
         forward_record "$port" "$cid" "$name"
+        clear_conflicts_for_port "$port"
         log "forward 127.0.0.1:$port -> $name"
         return 0
     fi
@@ -269,6 +324,7 @@ add_forward() {
 
 cancel_forward() {
     local port="$1"
+    # -O cancel matches on the listen side only, so the remote address doesn't matter.
     mux_ssh -O cancel -L "127.0.0.1:$port:127.0.0.1:$port" "$TARGET" >/dev/null 2>&1 || true
     forward_forget "$port"
     log "cancel 127.0.0.1:$port"
@@ -286,10 +342,11 @@ cancel_all_forwards() {
 }
 
 add_container_forwards() {
-    local cid="$1" name="$2" port
-    for port in $(docker --context "$CONTEXT" port "$cid" 2>/dev/null | parse_published_ports); do
-        add_forward "$port" "$cid" "$name" || true
-    done
+    local cid="$1" name="$2" port addr
+    while read -r port addr; do
+        [[ -n "$port" ]] || continue
+        add_forward "$port" "$addr" "$cid" "$name" || true
+    done < <(docker --context "$CONTEXT" port "$cid" 2>/dev/null | parse_published_ports)
 }
 
 cancel_container_forwards() {
@@ -297,19 +354,30 @@ cancel_container_forwards() {
     for port in $(forward_ports_for "$cid"); do
         cancel_forward "$port"
     done
+    clear_conflicts_for_container "$cid"
 }
 
-# Brings forwards in line with the containers that are running right now.
+# Brings forwards (and remembered conflicts) in line with the containers that
+# are running right now. Returns 1 if the daemon can't be asked.
 # --no-trunc: full IDs, so they compare equal to the IDs in `docker events`.
 reconcile() {
-    local running known cid name port
-    running="$(docker --context "$CONTEXT" ps --no-trunc --format '{{.ID}} {{.Names}}')" ||
-        die "cannot list containers on context '$CONTEXT'"
+    local running known cid name port _rest
+    running="$(docker --context "$CONTEXT" ps --no-trunc --format '{{.ID}} {{.Names}}')" || {
+        log "cannot list containers on context '$CONTEXT'"
+        return 1
+    }
     known="$(cat "$FORWARDS_FILE" 2>/dev/null || true)"
     while read -r port cid name; do
         [[ -n "$port" ]] || continue
         if ! grep -q "^$cid " <<< "$running"; then
             cancel_forward "$port"
+        fi
+    done <<< "$known"
+    known="$(cat "$CONFLICTS_FILE" 2>/dev/null || true)"
+    while IFS='|' read -r port cid _rest; do
+        [[ -n "$port" ]] || continue
+        if ! grep -q "^$cid " <<< "$running"; then
+            clear_conflicts_for_container "$cid"
         fi
     done <<< "$known"
     while read -r cid name; do
@@ -335,11 +403,11 @@ follow_events() {
         done
 }
 
-forwarder_exit() {
+# Runs on every exit of the forwarder: nothing stays in the master.
+forwarder_cleanup() {
     kill_descendants $$
     cancel_all_forwards
     rm -f "$FWD_READY_FILE"
-    exit 0
 }
 
 # True while the pid file still names this forwarder; `down` removes it.
@@ -348,13 +416,14 @@ forwarder_wanted() {
 }
 
 # Background process started by `up`: reconcile once, then follow events.
-# If the stream ends (VM reboot, SSH drop), drop the forwards, wait for the
-# daemon to come back, and start over.
+# If the stream ends (VM reboot, SSH drop), keep the forwards, wait with
+# backoff, and reconcile again: stale ones go, new ones come.
 forwarder_main() {
-    local loop_pid backoff=2 ticks=0
+    local loop_pid backoff=2 ticks=0 daemon_ok=1 started
     FORWARDER_PID=$$
     trap '' HUP
-    trap 'forwarder_exit' TERM INT
+    trap 'exit 0' TERM INT
+    trap 'forwarder_cleanup' EXIT
     # `up` writes the pid file right after starting us; wait for it briefly.
     until forwarder_wanted; do
         [[ $ticks -lt 50 ]] || exit 1
@@ -362,30 +431,39 @@ forwarder_main() {
         ticks=$((ticks + 1))
     done
     resolve_target
-    reconcile
+    reconcile || exit 1
     touch "$FWD_READY_FILE"
     while forwarder_wanted; do
+        started="$(date +%s)"
         follow_events &
         loop_pid=$!
         wait "$loop_pid" || true
         forwarder_wanted || break
-        notify "docker events stream ended; dropping forwards until the daemon answers again"
-        cancel_all_forwards
-        sleep 1
-        until daemon_reachable; do
-            forwarder_wanted || break
-            sleep "$backoff"
-            backoff=$(( backoff < 30 ? backoff * 2 : 30 ))
-        done
-        forwarder_wanted || break
-        backoff=2
-        if ! master_running; then
-            start_master || continue
+        # A stream that stayed up a while earns a fresh backoff; a stream that
+        # ends immediately (daemon flapping) backs off further each time.
+        if [[ $(( $(date +%s) - started )) -ge 10 ]]; then
+            backoff=2
         fi
-        notify "daemon is back; mirroring ports again"
-        reconcile
+        log "docker events stream ended; retrying in ${backoff}s"
+        sleep "$backoff"
+        backoff=$(( backoff < 30 ? backoff * 2 : 30 ))
+        forwarder_wanted || break
+        if ! master_running && ! start_master; then
+            daemon_ok=0
+            continue
+        fi
+        if reconcile; then
+            if [[ $daemon_ok -eq 0 ]]; then
+                notify "daemon is back; mirroring ports again"
+                daemon_ok=1
+            fi
+        else
+            if [[ $daemon_ok -eq 1 ]]; then
+                notify "lost the daemon; keeping forwards and retrying until it answers"
+                daemon_ok=0
+            fi
+        fi
     done
-    forwarder_exit
 }
 
 forwarder_pid() { cat "$FWD_PID_FILE" 2>/dev/null || true; }
@@ -412,12 +490,15 @@ start_forwarder() {
     echo "$pid" > "$FWD_PID_FILE"
     while [[ ! -f "$FWD_READY_FILE" ]]; do
         if ! pid_alive "$pid"; then
+            rm -f "$FWD_PID_FILE"
             tail -n 5 "$FWD_LOG" >&2 || true
-            die "port forwarder failed to start (see $FWD_LOG)"
+            log "port forwarder failed to start (see $FWD_LOG)"
+            return 1
         fi
         if [[ $ticks -ge 300 ]]; then
-            kill_tree "$pid"
-            die "port forwarder did not become ready within 30s (see $FWD_LOG)"
+            stop_forwarder
+            log "port forwarder did not become ready within 30s (see $FWD_LOG)"
+            return 1
         fi
         sleep 0.1
         ticks=$((ticks + 1))
@@ -474,17 +555,20 @@ sync_ignore_patterns() {
 
 sync_beta_url() { echo "$TARGET:${SSH_PORT:+$SSH_PORT:}$PWD"; }
 
+mutagen_available() { command -v mutagen >/dev/null 2>&1; }
+
 sync_exists() { mutagen sync list "$(sync_name)" >/dev/null 2>&1; }
 
 # The same absolute path must exist on the VM and be writable by this user.
 ensure_remote_dir() {
-    local quoted
+    local quoted prefix
     quoted="$(printf '%q' "$PWD")"
-    # shellcheck disable=SC2046
-    if ! ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=5 "$TARGET" \
-            "mkdir -p $quoted && [ -w $quoted ] && [ -O $quoted ]" 2>/dev/null; then
+    if ! mux_ssh -n "$TARGET" "mkdir -p $quoted && [ -w $quoted ] && [ -O $quoted ]" 2>/dev/null; then
+        # The prefix to create on the VM is the laptop home when the checkout is under it.
+        prefix="$(dirname "$PWD")"
+        [[ "$PWD" == "$HOME"/* ]] && prefix="$HOME"
         log "$PWD does not exist on $TARGET, or is not owned by you."
-        log "On the VM, run:  sudo ./guest/allow-path.sh ${TARGET%%@*} $(printf '%q' "$(dirname "$PWD")")"
+        log "On the VM, run:  sudo ./guest/allow-path.sh ${TARGET%%@*} $(printf '%q' "$prefix")"
         log "sync not possible until the path exists on the VM and is owned by you"
         return 1
     fi
@@ -494,7 +578,7 @@ ensure_remote_dir() {
 start_sync() {
     local name pattern ignore_args=()
     sync_enabled || return 0
-    if ! command -v mutagen >/dev/null 2>&1; then
+    if ! mutagen_available; then
         log "mutagen not found. Install it (https://mutagen.io) or set DEVHOST_NO_SYNC=1 for ports only."
         return 1
     fi
@@ -543,12 +627,37 @@ stop_sync() {
 }
 
 # --------------------------------------------------------------- sessions
+#
+# A directory is "up" while sessions/<id> exists. Its MODE is "up" for an
+# explicit `devhost up` (stays until `down`) or "run" when the first `run`
+# started it (torn down when the last concurrent run finishes). Every active
+# run registers its pid under sessions/<id>.runs/.
 
 session_id() { printf '%s' "$PWD" | cksum | cut -d' ' -f1; }
-session_registered() { [[ -f "$SESSIONS_DIR/$(session_id)" ]]; }
-register_session() { echo "$PWD" > "$SESSIONS_DIR/$(session_id)"; }
-unregister_session() { rm -f "$SESSIONS_DIR/$(session_id)"; }
-sessions_remaining() { [[ -n "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]]; }
+session_file() { echo "$SESSIONS_DIR/$(session_id)"; }
+runs_dir() { echo "$SESSIONS_DIR/$(session_id).runs"; }
+session_registered() { [[ -f "$(session_file)" ]]; }
+session_mode() { sed -n '2p' "$(session_file)" 2>/dev/null || true; }
+register_session() { printf '%s\n%s\n' "$PWD" "$1" > "$(session_file)"; }
+unregister_session() { rm -rf "$(session_file)" "$(runs_dir)"; }
+
+register_run() { mkdir -p "$(runs_dir)"; echo "$$" > "$(runs_dir)/$$"; }
+unregister_run() { rm -f "$(runs_dir)/$$"; }
+
+# True if another `run` for this directory is still alive (dead ones are pruned).
+other_runs_alive() {
+    local f pid alive=1
+    for f in "$(runs_dir)"/*; do
+        [[ -e "$f" ]] || continue
+        pid="${f##*/}"
+        if [[ "$pid" != "$$" ]] && pid_alive "$pid"; then
+            alive=0
+        elif [[ "$pid" != "$$" ]]; then
+            rm -f "$f"
+        fi
+    done
+    return $alive
+}
 
 # A session file is only trusted while the processes behind it are alive;
 # a crash or kill -9 leaves the file behind.
@@ -557,9 +666,74 @@ session_active() {
     if forwarder_running && master_running && { ! sync_enabled || sync_exists; }; then
         return 0
     fi
-    log "stale session for $PWD (processes gone); restarting it"
+    if sync_enabled && ! mutagen_available; then
+        log "stale session for $PWD (mutagen is not installed); restarting it"
+    else
+        log "stale session for $PWD (processes gone); restarting it"
+    fi
     unregister_session
     return 1
+}
+
+# Drops "run" sessions whose runs are all dead (leftovers from a crash).
+# Caller holds the lock.
+prune_sessions() {
+    local f
+    for f in "$SESSIONS_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        if [[ "$(sed -n '2p' "$f")" == run ]] && ! runs_alive_in "${f}.runs"; then
+            rm -rf "$f" "${f}.runs"
+        fi
+    done
+}
+
+# True if any directory is still up.
+sessions_remaining() {
+    local f
+    for f in "$SESSIONS_DIR"/*; do
+        [[ -f "$f" ]] && return 0
+    done
+    return 1
+}
+
+runs_alive_in() {
+    local f
+    for f in "$1"/*; do
+        [[ -e "$f" ]] || continue
+        pid_alive "${f##*/}" && return 0
+    done
+    return 1
+}
+
+# Starts everything for $PWD in mode $1 (up|run). Caller holds the lock.
+session_start() {
+    local mode="$1"
+    daemon_reachable ||
+        die "cannot reach the daemon on context '$CONTEXT' (try: devhost probe)"
+    start_master || exit 1
+    if ! start_forwarder || ! start_sync; then
+        # Don't leave a master and forwarder behind for a session that never started.
+        sessions_remaining || { stop_forwarder; stop_master; }
+        exit 1
+    fi
+    register_session "$mode"
+    log "up: forwarding published ports to 127.0.0.1; $(sync_enabled && echo "syncing $PWD" || echo "sync disabled")"
+    log "conflicts found later are printed to this terminal and by 'devhost status'/'devhost flush'; log: $FWD_LOG"
+    report_conflicts || true
+}
+
+# Stops the session for $PWD; the forwarder and master go when no directory
+# is left. Caller holds the lock.
+session_stop() {
+    flush_sync
+    stop_sync
+    unregister_session
+    prune_sessions
+    if ! sessions_remaining; then
+        stop_forwarder
+        stop_master
+        rm -f "$FORWARDS_FILE" "$CONFLICTS_FILE"
+    fi
 }
 
 # --------------------------------------------------------------- commands
@@ -582,38 +756,29 @@ cmd_probe() {
 cmd_up() {
     init_state
     resolve_target
+    trap 'lock_release' EXIT
+    lock_acquire
     if session_active; then
+        if [[ "$(session_mode)" == run ]]; then
+            register_session up    # a running `run` started it; keep it after that run ends
+        fi
         log "$PWD is already up"
-        return 0
+    else
+        session_start up
     fi
-    daemon_reachable ||
-        die "cannot reach the daemon on context '$CONTEXT' (try: devhost probe)"
-    start_master || exit 1
-    start_forwarder
-    if ! start_sync; then
-        # Don't leave a master and forwarder behind for a session that never started.
-        sessions_remaining || { stop_forwarder; stop_master; }
-        exit 1
-    fi
-    register_session
-    log "up: forwarding published ports to 127.0.0.1; $(sync_enabled && echo "syncing $PWD" || echo "sync disabled")"
-    log "conflicts found later are printed to this terminal and by 'devhost status'/'devhost flush'; log: $FWD_LOG"
-    report_conflicts || true
+    lock_release
 }
 
 cmd_down() {
     init_state
     resolve_target
-    if session_registered; then
-        flush_sync
-        stop_sync
-        unregister_session
+    trap 'lock_release' EXIT
+    lock_acquire
+    if other_runs_alive; then
+        log "warning: a 'devhost run' is still active in $PWD; stopping its forwards and sync anyway"
     fi
-    if ! sessions_remaining; then
-        stop_forwarder
-        stop_master
-        rm -f "$FORWARDS_FILE" "$CONFLICTS_FILE"
-    fi
+    session_stop
+    lock_release
     log "down"
 }
 
@@ -626,16 +791,19 @@ cmd_flush() {
     report_conflicts
 }
 
-RUN_NESTED=0
+RUN_MODE=""
 RUN_DONE=0
 run_cleanup() {
     [[ $RUN_DONE -eq 0 ]] || return 0
     RUN_DONE=1
-    if [[ $RUN_NESTED -eq 0 ]]; then
-        cmd_down
+    lock_acquire
+    unregister_run
+    if [[ "$RUN_MODE" == run && "$(session_mode)" == run ]] && ! other_runs_alive; then
+        session_stop     # last run out of a run-started session tears it down
     else
         flush_sync
     fi
+    lock_release
 }
 
 cmd_run() {
@@ -647,14 +815,21 @@ cmd_run() {
     trap 'run_cleanup' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    lock_acquire
     if session_active; then
-        RUN_NESTED=1
+        RUN_MODE="$(session_mode)"
     else
-        cmd_up
+        session_start run
+        RUN_MODE=run
     fi
+    register_run
+    lock_release
     # Conflicts found before the command even ran: refuse rather than let the
     # project talk to whatever holds the port on this laptop.
-    [[ -s "$CONFLICTS_FILE" ]] && exit 1
+    if [[ -s "$CONFLICTS_FILE" ]]; then
+        report_conflicts || true
+        exit 1
+    fi
     flush_sync
     set +e
     DOCKER_CONTEXT="$CONTEXT" "$@"
@@ -673,7 +848,7 @@ cmd_run() {
 }
 
 cmd_status() {
-    local port cid name reason dir
+    local port cid name reason f
     init_state
     resolve_target
     if [[ -s "$CONFLICTS_FILE" ]]; then
@@ -709,13 +884,14 @@ cmd_status() {
     fi
     if sessions_remaining; then
         echo "up in:"
-        for dir in "$SESSIONS_DIR"/*; do
-            echo "  $(cat "$dir")"
+        for f in "$SESSIONS_DIR"/*; do
+            [[ -f "$f" ]] || continue
+            echo "  $(sed -n '1p' "$f") ($(sed -n '2p' "$f"))"
         done
     else
         echo "up in:      no directories"
     fi
-    if sync_enabled && command -v mutagen >/dev/null 2>&1; then
+    if sync_enabled && mutagen_available; then
         if sync_exists; then
             echo "sync ($PWD):"
             mutagen sync list "$(sync_name)" 2>/dev/null | sed 's/^/  /' || true

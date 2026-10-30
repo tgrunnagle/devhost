@@ -7,6 +7,7 @@
 #   events-delay  seconds to wait before emitting the events (default 0)
 #   events-hold   seconds to keep `docker events` open after emitting (default 30)
 #   unreachable   if present, every command fails like a dead daemon
+#   ps-fail       if present, only `docker ps --no-trunc ...` (reconcile) fails
 # Every invocation is appended to $FAKE_DIR/docker.log.
 set -u
 echo "docker $*" >> "$FAKE_DIR/docker.log"
@@ -29,6 +30,10 @@ case "${args[0]}" in
         echo "ssh://${FAKE_ENDPOINT:-alice@devhost}"
         ;;
     ps)
+        if [[ -f "$FAKE_DIR/ps-fail" && " ${args[*]} " == *" --no-trunc "* ]]; then
+            echo "error during connect: EOF" >&2
+            exit 1
+        fi
         cat "$FAKE_DIR/ps" 2>/dev/null || true
         ;;
     port)
