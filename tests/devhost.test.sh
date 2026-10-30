@@ -96,14 +96,14 @@ test_reconcile_adds_forwards() {
     assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:6379:127.0.0.1:6379 alice@devhost" "redis forward"
     assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:48080:127.0.0.1:48080 alice@devhost" "web forward"
     assert_eq "$(grep -c '^' "$FAKE_DIR/ssh.log")" "2" "one forward per port"
-    assert_file_has "$FORWARDS_FILE" "6379 abc123def456 redis" "redis recorded"
-    assert_file_has "$FORWARDS_FILE" "48080 789abc012def web" "web recorded"
+    assert_file_has "$FORWARDS_FILE" "6379 127.0.0.1 abc123def456 redis" "redis recorded"
+    assert_file_has "$FORWARDS_FILE" "48080 127.0.0.1 789abc012def web" "web recorded"
     assert_eq "$(cat "$CONFLICTS_FILE" 2>/dev/null)" "" "no conflicts"
 }
 
 test_reconcile_cancels_stale_forwards() {
     load
-    printf '6379 deadbeef0000 oldredis\n' > "$FORWARDS_FILE"
+    printf '6379 127.0.0.1 deadbeef0000 oldredis\n' > "$FORWARDS_FILE"
     : > "$FAKE_DIR/ps"
     reconcile 2>/dev/null
     assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:6379:127.0.0.1:6379" "stale forward cancelled"
@@ -115,7 +115,7 @@ test_events_add_and_remove() {
     echo "3000/tcp -> 127.0.0.1:3000" > "$FAKE_DIR/port.c0ffee000001"
     handle_event start c0ffee000001 api 2>/dev/null
     assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:3000:127.0.0.1:3000" "start adds forward"
-    assert_file_has "$FORWARDS_FILE" "3000 c0ffee000001 api" "recorded"
+    assert_file_has "$FORWARDS_FILE" "3000 127.0.0.1 c0ffee000001 api" "recorded"
     handle_event die c0ffee000001 api 2>/dev/null
     assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:3000:127.0.0.1:3000" "die cancels forward"
     assert_eq "$(cat "$FORWARDS_FILE")" "" "forward forgotten after die"
@@ -127,9 +127,9 @@ test_follow_events_pipeline() {
     printf 'start aaaa00000001 nginx\ndie aaaa00000001 nginx\n' > "$FAKE_DIR/events"
     echo 0 > "$FAKE_DIR/events-hold"
     echo $$ > "$FWD_PID_FILE"      # the loop stops once the pid file no longer names it
-    follow_events 2>/dev/null
+    follow_events "$(date +%s)" 2>/dev/null
     rm -f "$FWD_PID_FILE"          # $$ is the harness; don't let teardown kill it
-    assert_file_has "$FAKE_DIR/docker.log" "events --filter type=container --filter event=start --filter event=die" "events filters"
+    assert_file_has "$FAKE_DIR/docker.log" "--filter type=container --filter event=start --filter event=die" "events filters"
     assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:48081:127.0.0.1:48081" "forward from event"
     assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:48081:127.0.0.1:48081" "cancel from event"
 }
@@ -168,6 +168,68 @@ test_forward_binds_loopback_only() {
     echo "80/tcp -> 192.168.1.5:8081" > "$FAKE_DIR/port.cccc00000002"
     handle_event start cccc00000002 lanonly 2>/dev/null
     assert_file_has "$FAKE_DIR/ssh.log" "-L 127.0.0.1:8081:192.168.1.5:8081" "a port on a specific VM interface is reached there"
+    handle_event die cccc00000002 lanonly 2>/dev/null
+    assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:8081:192.168.1.5:8081" "cancelled with the same spec"
+    assert_eq "$(cat "$FAKE_DIR/open-forwards")" "127.0.0.1:8080:127.0.0.1:8080" "only the live forward stays open in the master"
+    echo "80/tcp -> [fe80::1]:8082" > "$FAKE_DIR/port.cccc00000003"
+    handle_event start cccc00000003 v6 2>/dev/null
+    assert_file_has "$FAKE_DIR/ssh.log" "-L 127.0.0.1:8082:[fe80::1]:8082" "IPv6 connect host is bracketed"
+}
+
+test_events_replayed_since_reconcile() {
+    load
+    echo $$ > "$FWD_PID_FILE"
+    echo 0 > "$FAKE_DIR/events-hold"
+    follow_events 1700000000 2>/dev/null
+    rm -f "$FWD_PID_FILE"
+    assert_file_has "$FAKE_DIR/docker.log" "events --since 1700000000 --filter" "events replayed from the reconcile time"
+}
+
+test_conflict_retried_once_port_is_free() {
+    echo "6379 redis-server 9999" > "$FAKE_DIR/busy-ports"
+    printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
+    echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
+    run_devhost up 2>/dev/null || fail "up"
+    assert_eq "$(grep -c '^' "$DEVHOST_STATE_DIR/conflicts")" "1" "conflict at up"
+    local rc=0
+    run_devhost flush >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" "1" "flush fails while the port is busy"
+    rm -f "$FAKE_DIR/busy-ports"                      # the local redis went away
+    run_devhost run -- sh -c 'echo ran > ran' 2>/dev/null || fail "run succeeds once the port is free"
+    assert_exists ran "command ran"
+    assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:6379:127.0.0.1:6379" "forward established on retry"
+    assert_eq "$(cat "$DEVHOST_STATE_DIR/conflicts")" "" "conflict cleared"
+    run_devhost down 2>/dev/null || fail "down"
+}
+
+test_stale_locks_are_reclaimed() {
+    : > "$FAKE_DIR/ps"
+    mkdir -p "$DEVHOST_STATE_DIR/lock"
+    echo 999999 > "$DEVHOST_STATE_DIR/lock/pid"       # holder is long dead
+    run_devhost up 2>/dev/null || fail "up past a dead holder's lock"
+    run_devhost down 2>/dev/null || fail "down"
+    mkdir -p "$DEVHOST_STATE_DIR/lock"                 # no pid file, old mtime
+    touch -t 202001010000 "$DEVHOST_STATE_DIR/lock"
+    run_devhost up 2>/dev/null || fail "up past an old pid-less lock"
+    run_devhost down 2>/dev/null || fail "down"
+    assert_missing "$DEVHOST_STATE_DIR/lock" "lock released"
+}
+
+test_lock_serialises_concurrent_ups() {
+    : > "$FAKE_DIR/ps"
+    mkdir -p "$TMP/other"
+    local p1 p2
+    run_devhost up 2>/dev/null &
+    p1=$!
+    (cd "$TMP/other" && run_devhost up 2>/dev/null) &
+    p2=$!
+    wait "$p1" || fail "up 1"
+    wait "$p2" || fail "up 2"
+    assert_eq "$(grep -c -- '-M -N -f' "$FAKE_DIR/ssh.log")" "1" "exactly one master for two simultaneous ups"
+    assert_eq "$(find "$DEVHOST_STATE_DIR/sessions" -maxdepth 1 -type f | wc -l | tr -d ' ')" "2" "both directories registered"
+    run_devhost down 2>/dev/null || fail "down 1"
+    (cd "$TMP/other" && run_devhost down 2>/dev/null) || fail "down 2"
+    assert_missing "$FAKE_DIR/master" "all stopped"
 }
 
 test_conflicts_are_cleared_and_deduped() {
@@ -191,13 +253,15 @@ test_conflicts_are_cleared_and_deduped() {
     rm -f "$FAKE_DIR/busy-ports"
     reconcile 2>/dev/null
     assert_eq "$(cat "$CONFLICTS_FILE")" "" "forwarded once the port is free, conflict cleared"
-    assert_file_has "$FORWARDS_FILE" "6379 abc123def456 redis" "forward recorded"
+    assert_file_has "$FORWARDS_FILE" "6379 127.0.0.1 abc123def456 redis" "forward recorded"
 }
 
 test_nested_run_reports_conflict() {
-    : > "$FAKE_DIR/ps"
+    # A real, persisting conflict: the container keeps running and the port stays busy.
+    echo "6379 redis-server 9999" > "$FAKE_DIR/busy-ports"
+    printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
+    echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
     run_devhost up 2>/dev/null || fail "up"
-    echo "6379|abc123def456|redis|port already in use on this laptop by redis-server (pid 9999)" >> "$DEVHOST_STATE_DIR/conflicts"
     local out rc=0
     out="$(run_devhost run -- sh -c 'echo ran > ran' 2>&1)" || rc=$?
     assert_eq "$rc" "1" "nested run refuses"
@@ -361,7 +425,7 @@ test_stale_session_is_restarted() {
 test_start_forwarder_cancels_forwards_left_behind() {
     : > "$FAKE_DIR/ps"
     mkdir -p "$DEVHOST_STATE_DIR"
-    echo "6379 deadbeefdead oldredis" > "$DEVHOST_STATE_DIR/forwards"  # forwarder died, master kept it
+    echo "6379 127.0.0.1 deadbeefdead oldredis" > "$DEVHOST_STATE_DIR/forwards"  # forwarder died, master kept it
     touch "$FAKE_DIR/master"
     run_devhost up 2>/dev/null || fail "up"
     assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:6379:127.0.0.1:6379" "leftover forward cancelled"
@@ -377,7 +441,7 @@ test_master_owned_listener_is_not_a_conflict() {
     echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
     reconcile 2>/dev/null
     assert_eq "$(cat "$CONFLICTS_FILE" 2>/dev/null)" "" "no conflict"
-    assert_file_has "$FORWARDS_FILE" "6379 abc123def456 redis" "adopted as a forward"
+    assert_file_has "$FORWARDS_FILE" "6379 127.0.0.1 abc123def456 redis" "adopted as a forward"
 }
 
 test_forwarder_reconnects_when_stream_ends() {
@@ -411,13 +475,14 @@ test_up_refuses_remote_dir_not_owned() {
 }
 
 test_flush_reports_conflicts_during_up() {
-    : > "$FAKE_DIR/ps"
+    echo "6379 redis-server 9999" > "$FAKE_DIR/busy-ports"
+    printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
+    echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
     run_devhost up 2>/dev/null || fail "up"
-    echo "6379|abc123def456|redis|port already in use on this laptop by redis-server (pid 4242)" >> "$DEVHOST_STATE_DIR/conflicts"
     local out rc=0
     out="$(run_devhost flush 2>&1)" || rc=$?
     assert_eq "$rc" "1" "flush fails on conflicts"
-    [[ "$out" == *"127.0.0.1:6379"*"redis-server (pid 4242)"* ]] || fail "flush reports the conflict: $out"
+    [[ "$out" == *"127.0.0.1:6379"*"redis-server (pid 9999)"* ]] || fail "flush reports the conflict: $out"
     out="$(run_devhost status 2>/dev/null)"
     [[ "$out" == CONFLICTS* ]] || fail "status leads with conflicts: $out"
     run_devhost down 2>/dev/null || fail "down"
@@ -429,7 +494,7 @@ test_reconcile_then_die_with_full_length_id() {
     printf '%s redis\n' "$long" > "$FAKE_DIR/ps"                 # --no-trunc IDs
     echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
     reconcile 2>/dev/null
-    assert_file_has "$FORWARDS_FILE" "6379 $long redis" "recorded with the full ID"
+    assert_file_has "$FORWARDS_FILE" "6379 127.0.0.1 $long redis" "recorded with the full ID"
     reconcile 2>/dev/null
     assert_file_lacks "$FAKE_DIR/ssh.log" "-O cancel" "second reconcile keeps the forward (IDs compare equal)"
     handle_event die "$long" redis 2>/dev/null
