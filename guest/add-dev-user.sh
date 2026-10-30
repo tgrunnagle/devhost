@@ -4,7 +4,8 @@
 # Usage (inside the VM):  sudo ./add-dev-user.sh <username> <public-key-file>
 #
 # Creates the user if needed (no password; key-only login), appends the public key to
-# their authorized_keys, and adds them to the docker group.
+# their authorized_keys, and adds them to the docker group and to the devhost group
+# (which lets them take `devhost lock` locks).
 #
 # Note: membership in the docker group is equivalent to root on this VM.
 set -euo pipefail
@@ -53,5 +54,12 @@ chmod 0600 "$home/.ssh/authorized_keys"
 
 usermod -aG docker "$user"
 echo "==> $user is in the docker group"
+if getent group devhost >/dev/null; then
+    usermod -aG devhost "$user"
+    echo "==> $user is in the devhost group"
+else
+    echo "warning: no devhost group yet, so $user can't use 'devhost lock'." >&2
+    echo "         Re-run install-docker.sh (it's safe to), then this script." >&2
+fi
 echo
 echo "On their laptop: client/add-devhost-context.sh $(hostname) $user"

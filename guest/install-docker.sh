@@ -7,7 +7,11 @@
 # - Rotates container logs so a chatty container can't fill the disk.
 # - Raises sshd session limits; Docker over SSH (and Compose especially) opens many
 #   sessions at once and hits the default limit of 10.
-# - Adds the invoking user to the docker group.
+# - Has sshd drop sessions from laptops that vanish, so `devhost lock` locks held by
+#   them are released.
+# - Creates the devhost group and the /run/lock/devhost directory used by
+#   `devhost lock` (recreated at every boot by systemd-tmpfiles).
+# - Adds the invoking user to the docker and devhost groups.
 #
 # Safe to re-run.
 set -euo pipefail
@@ -71,13 +75,26 @@ cat > /etc/ssh/sshd_config.d/50-devhost.conf <<'EOF'
 # Docker contexts over SSH open a session per API call; Compose opens many at once.
 MaxSessions 64
 MaxStartups 64:30:128
+# Drop sessions whose laptop is gone (sleep, Wi-Fi drop) within ~40s, which releases
+# any `devhost lock` they hold.
+ClientAliveInterval 10
+ClientAliveCountMax 3
 EOF
 sshd -t
 systemctl reload ssh
 
+echo "==> Creating the devhost group and /run/lock/devhost for host-wide locks"
+groupadd -f devhost
+# /run is a tmpfs, so let systemd-tmpfiles recreate the directory at every boot.
+# setgid keeps lock files in the devhost group; only group members can take locks.
+cat > /etc/tmpfiles.d/devhost.conf <<'EOF'
+d /run/lock/devhost 2770 root devhost -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/devhost.conf
+
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
-    usermod -aG docker "$SUDO_USER"
-    echo "==> Added $SUDO_USER to the docker group (log out and back in to use it)"
+    usermod -aG docker,devhost "$SUDO_USER"
+    echo "==> Added $SUDO_USER to the docker and devhost groups (log out and back in to use them)"
 fi
 
 echo

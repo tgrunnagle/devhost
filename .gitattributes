@@ -7,3 +7,4 @@
 # Scripts that run inside Linux or on macOS must keep LF, or bash fails with
 # "/bin/bash^M: bad interpreter".
 *.sh   text eol=lf
+client/devhost text eol=lf
