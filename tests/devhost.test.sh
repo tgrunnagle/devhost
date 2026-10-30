@@ -913,7 +913,7 @@ test_symlinked_checkout_syncs_logical_path() {
     fi
     cd "$TMP/link" || exit 1
     start_sync 2>/dev/null
-    assert_file_has "$FAKE_DIR/mutagen.log" "--sync-mode two-way-resolved $TMP/link alice@devhost:$TMP/link" "the sync uses the path as typed: what -v \$PWD expands to"
+    assert_file_has "$FAKE_DIR/mutagen.log" "--sync-mode two-way-resolved --ignore node_modules --ignore .git --ignore .venv --ignore target --ignore dist $TMP/link alice@devhost:$TMP/link" "the sync uses the path as typed: what -v \$PWD expands to"
     assert_eq "$(sync_name)" "devhost-$(printf '%s' "$PROJECT" | cksum | cut -d' ' -f1)" "but is keyed by the physical path"
     cd "$PROJECT" || exit 1
     start_sync 2>/dev/null
