@@ -36,8 +36,18 @@ fi
 
 case "${args[0]}" in
     context)
-        [[ "$format" == '{{.Endpoints.docker.Host}}' ]] || bad_format
-        echo "ssh://${FAKE_ENDPOINT:-alice@devhost}"
+        case "${args[1]:-}" in
+            inspect)
+                [[ -n "$format" ]] || exit 0     # existence check
+                [[ "$format" == '{{.Endpoints.docker.Host}}' ]] || bad_format
+                echo "ssh://${FAKE_ENDPOINT:-alice@devhost}"
+                ;;
+            create|update) ;;
+            *)
+                echo "fake docker: unsupported: ${args[*]}" >&2
+                exit 1
+                ;;
+        esac
         ;;
     ps)
         if [[ -f "$FAKE_DIR/ps-fail" && " ${args[*]} " == *" --no-trunc "* ]]; then

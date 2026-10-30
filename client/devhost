@@ -35,6 +35,9 @@
 
 CONTEXT="${DEVHOST_CONTEXT:-devhost}"
 STATE_DIR="${DEVHOST_STATE_DIR:-$HOME/.devhost}"
+# Mutagen label for this state directory's sessions, so two state dirs on one
+# laptop (tests, a second profile) never terminate each other's syncs.
+STATE_LABEL="devhost-state=$(printf '%s' "$STATE_DIR" | cksum | cut -d' ' -f1)"
 FLUSH_TIMEOUT="${DEVHOST_FLUSH_TIMEOUT:-60}"
 SYNC_TIMEOUT="${DEVHOST_SYNC_TIMEOUT:-600}"
 CONFLICT_MODE="${DEVHOST_CONFLICTS:-auto}"
@@ -118,10 +121,9 @@ pid_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
 # Serialises state transitions across concurrent invocations (mkdir is atomic;
 # macOS has no flock). $1 is the lock directory (default: the global lock).
 # Re-entrant for the holding process. Waits as long as the holder is alive; a
-# lock whose holder died (or that never got a pid and is old) is reclaimed by
-# renaming it first, so only one waiter wins.
+# lock whose holder died (or that never got a pid and is old) is reclaimed.
 lock_acquire() {
-    local dir="${1:-$LOCK_DIR}" ticks=0 owner stale stale_dir taken
+    local dir="${1:-$LOCK_DIR}" ticks=0 owner stale
     while ! mkdir "$dir" 2>/dev/null; do
         owner="$(cat "$dir/pid" 2>/dev/null || true)"
         if [[ "$owner" == "$$" ]]; then
@@ -134,18 +136,7 @@ lock_acquire() {
             stale=1
         fi
         if [[ $stale -eq 1 ]]; then
-            stale_dir="$dir.stale.$$"
-            if mv "$dir" "$stale_dir" 2>/dev/null; then
-                # Between judging the holder dead and the rename, another
-                # waiter may have reclaimed the lock and a third process taken
-                # it: then a live lock was just renamed. Give it back.
-                taken="$(cat "$stale_dir/pid" 2>/dev/null || true)"
-                if [[ -n "$taken" && "$taken" != "$owner" ]] && pid_alive "$taken"; then
-                    mv "$stale_dir" "$dir" 2>/dev/null || rm -rf "$stale_dir"
-                else
-                    rm -rf "$stale_dir"
-                fi
-            fi
+            reclaim_stale_lock "$dir" "$owner"
             continue
         fi
         if [[ $((ticks % 300)) -eq 299 ]]; then
@@ -155,6 +146,27 @@ lock_acquire() {
         ticks=$((ticks + 1))
     done
     echo "$$" > "$dir/pid"
+}
+
+# Removes lock $1 whose holder $2 (a pid, or "" for a pid-less old lock) was
+# judged dead. Reclaimers are serialised by a guard directory, and the lock
+# is re-read under it, so a lock that changed hands meanwhile is left alone
+# and no two processes ever end up holding it.
+reclaim_stale_lock() {
+    local dir="$1" owner="$2" guard="$1.reclaim"
+    if ! mkdir "$guard" 2>/dev/null; then
+        # Another process is reclaiming. A guard older than a minute was
+        # left behind by one that died doing so.
+        if [[ -n "$(find "$guard" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+            rm -rf "$guard"
+        fi
+        sleep 0.1
+        return 0
+    fi
+    if [[ "$(cat "$dir/pid" 2>/dev/null || true)" == "$owner" ]]; then
+        mv "$dir" "$guard/stale" 2>/dev/null || true
+    fi
+    rm -rf "$guard"
 }
 
 lock_release() {
@@ -755,8 +767,13 @@ check_conflict_mode() {
 
 sync_enabled() { [[ "${DEVHOST_NO_SYNC:-0}" != 1 ]]; }
 
+# Sessions and syncs are keyed by the physical path, so a checkout reached
+# through a symlink (macOS /tmp -> /private/tmp, a linked ~/src) is one
+# checkout. The sync itself uses the logical $PWD: that is what the user's
+# "-v $PWD:/src" expands to, so that is the path containers must find on the VM.
+phys_pwd() { pwd -P; }
 sync_name_for() { echo "devhost-$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
-sync_name() { sync_name_for "$PWD"; }
+sync_name() { sync_name_for "$(phys_pwd)"; }
 
 # Prints ignore patterns, one per line: .devhostignore if present, else defaults.
 sync_ignore_patterns() {
@@ -798,25 +815,28 @@ ensure_remote_dir() {
     fi
 }
 
-# Laptop paths of every devhost sync session Mutagen knows about.
+# Laptop paths of every devhost sync session of this state directory.
 devhost_sync_alphas() {
-    mutagen sync list --label-selector devhost=1 2>/dev/null |
-        awk '/^Alpha:/ { a = 1; next } a && $1 == "URL:" { print $2; a = 0 }' || true
+    mutagen sync list --label-selector "$STATE_LABEL" 2>/dev/null |
+        awk '/^Alpha:/ { a = 1; next } a && $1 == "URL:" { sub(/^[ \t]*URL: /, ""); print; a = 0 }' || true
 }
 
 # Two sessions over the same files would fight: refuse when another devhost
 # session already covers $PWD (a checkout that is up, run from one of its
-# subdirectories) or lies inside it.
+# subdirectories) or lies inside it. Compared as physical paths.
 check_no_overlapping_sync() {
-    local alpha
+    local alpha here
+    here="$(phys_pwd)"
     while read -r alpha; do
-        [[ -n "$alpha" && "$alpha" != "$PWD" ]] || continue
-        if [[ "$PWD" == "$alpha"/* ]]; then
+        [[ -n "$alpha" ]] || continue
+        alpha="$(cd "$alpha" 2>/dev/null && pwd -P || echo "$alpha")"
+        [[ "$alpha" != "$here" ]] || continue
+        if [[ "$here" == "$alpha"/* ]]; then
             log "$PWD is inside $alpha, which another devhost session already syncs."
             log "run from $alpha (its sync covers this directory), or 'devhost down' there first."
             return 1
         fi
-        if [[ "$alpha" == "$PWD"/* ]]; then
+        if [[ "$alpha" == "$here"/* ]]; then
             log "$alpha, inside this checkout, is already synced by another devhost session."
             log "'devhost down' there first: one session must cover a tree."
             return 1
@@ -829,6 +849,11 @@ terminate_sync_named() {
     mutagen sync list "$1" >/dev/null 2>&1 || return 0
     with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate "$1" >/dev/null 2>&1 ||
         log "warning: mutagen sync terminate $1 failed or timed out"
+}
+
+# Terminates every sync session of this state directory (leftovers included).
+terminate_all_syncs() {
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate --label-selector "$STATE_LABEL" >/dev/null 2>&1 || true
 }
 
 # Warns about files Mutagen cannot update in session $1.
@@ -850,18 +875,26 @@ warn_sync_problems() {
 prime_sync() {
     local name="$1" rc=0
     shift
-    with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name-prime" --label devhost=1 \
+    terminate_sync_named "$name-prime"     # left by an interrupted start: it would keep deleting
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name-prime" --label devhost=1 --label "$STATE_LABEL" \
         --sync-mode one-way-replica "$@" "$PWD" "$(sync_beta_url)" >/dev/null || {
         log "mutagen sync create (priming the VM copy) failed or timed out"
+        terminate_sync_named "$name-prime"
         return 1
     }
     with_deadline "$SYNC_TIMEOUT" mutagen sync flush "$name-prime" >/dev/null 2>&1 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        warn_sync_problems "$name-prime"
+    fi
     terminate_sync_named "$name-prime"
     if [[ $rc -eq 124 ]]; then
         log "initial sync of $PWD did not finish within ${SYNC_TIMEOUT}s (DEVHOST_SYNC_TIMEOUT)"
         return 1
     elif [[ $rc -ne 0 ]]; then
-        log "warning: priming the VM copy reported problems (devhost status for details)"
+        # Files the replica could not remove on the VM would come back here.
+        log "priming the VM copy of $PWD failed: files on the VM could not be updated or removed"
+        log "(root-owned files? see README); not starting a two-way sync over them"
+        return 1
     fi
 }
 
@@ -885,8 +918,8 @@ start_sync() {
     log "syncing $PWD -> $TARGET:$PWD"
     # ${arr[@]+...}: bash 3.2 treats an empty array as unbound under set -u.
     prime_sync "$name" ${ignore_args[@]+"${ignore_args[@]}"} || return 1
-    with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name" --label devhost=1 --sync-mode two-way-resolved \
-        ${ignore_args[@]+"${ignore_args[@]}"} "$PWD" "$(sync_beta_url)" >/dev/null || {
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name" --label devhost=1 --label "$STATE_LABEL" \
+        --sync-mode two-way-resolved ${ignore_args[@]+"${ignore_args[@]}"} "$PWD" "$(sync_beta_url)" >/dev/null || {
         log "mutagen sync create failed or timed out"
         return 1
     }
@@ -920,6 +953,7 @@ flush_sync() {
 stop_sync() {
     sync_enabled || return 0
     terminate_sync_named "$(sync_name)"
+    terminate_sync_named "$(sync_name)-prime"   # an interrupted priming must not keep running
 }
 
 # --------------------------------------------------------------- sessions
@@ -929,12 +963,13 @@ stop_sync() {
 # started it (torn down when the last concurrent run finishes). Every active
 # run registers its pid under sessions/<id>.runs/.
 
-session_id() { printf '%s' "$PWD" | cksum | cut -d' ' -f1; }
+session_id() { printf '%s' "$(phys_pwd)" | cksum | cut -d' ' -f1; }
 session_file() { echo "$SESSIONS_DIR/$(session_id)"; }
+session_lock() { echo "$SESSIONS_DIR/$(session_id).lock"; }
 runs_dir() { echo "$SESSIONS_DIR/$(session_id).runs"; }
 session_registered() { [[ -f "$(session_file)" ]]; }
 session_mode() { sed -n '2p' "$(session_file)" 2>/dev/null || true; }
-register_session() { printf '%s\n%s\n' "$PWD" "$1" > "$(session_file)"; }
+register_session() { printf '%s\n%s\n' "$(phys_pwd)" "$1" > "$(session_file)"; }
 unregister_session() { rm -rf "$(session_file)" "$(runs_dir)"; }
 
 register_run() { mkdir -p "$(runs_dir)"; echo "$$" > "$(runs_dir)/$$"; }
@@ -1016,10 +1051,15 @@ abandon_session() {
     stop_sync
     prune_sessions
     sessions_remaining || { stop_forwarder; stop_master; }
+    lock_release "$(session_lock)"    # held if the start was interrupted mid-sync
 }
 
-# Starts everything for $PWD in mode $1 (up|run). Caller holds the lock.
-# Returns 1 (after cleaning up) when it can't.
+STARTED_MODE=""   # the mode the session actually has after session_start
+
+# Starts everything for $PWD in mode $1 (up|run). Caller holds the global
+# lock. Returns 1 (after cleaning up) when it can't. The initial sync can
+# take minutes, so the global lock is released for it and only this
+# directory is locked; the shared pieces are checked again afterwards.
 session_start() {
     local mode="$1"
     daemon_reachable || {
@@ -1031,21 +1071,47 @@ session_start() {
         # Its forwards died with the old master; it re-adds them on reconcile.
         request_reconcile || true
     fi
-    if ! start_forwarder || ! start_sync; then
+    start_forwarder || { abandon_session; return 1; }
+    lock_release
+    lock_acquire "$(session_lock)"
+    if ! start_sync; then
+        lock_release "$(session_lock)"
+        lock_acquire
         abandon_session
         return 1
     fi
-    register_session "$mode"
+    lock_acquire
+    # A `down` elsewhere may have stopped the shared pieces meanwhile.
+    if ! start_master || ! start_forwarder; then
+        lock_release "$(session_lock)"
+        abandon_session
+        return 1
+    fi
+    if session_registered; then
+        mode="$(session_mode)"     # another command started it while we waited
+    else
+        register_session "$mode"
+    fi
+    lock_release "$(session_lock)"
+    STARTED_MODE="$mode"
     log "up: forwarding published ports to 127.0.0.1; $(sync_enabled && echo "syncing $PWD" || echo "sync disabled")"
     log "conflicts found later are printed to this terminal and by 'devhost status'/'devhost flush'; log: $FWD_LOG"
     [[ "$mode" == run ]] || report_conflicts || true   # `run` reports them itself
 }
 
 # Stops the session for $PWD; the forwarder and master go when no directory
-# is left. Caller holds the lock.
+# is left. Caller holds the lock. If the final flush fails, the sync session
+# is kept: terminating it would let the next session's priming delete
+# outputs on the VM that never reached the laptop.
 session_stop() {
-    flush_sync || log "warning: outputs may be stale on the laptop"
-    stop_sync
+    local keep_sync=0
+    if flush_sync; then
+        stop_sync
+    else
+        keep_sync=1
+        log "warning: keeping the sync session for $PWD so outputs on the VM are not lost;"
+        log "run 'devhost flush' or 'devhost down' here once the VM answers again"
+    fi
     unregister_session
     prune_sessions
     if ! sessions_remaining; then
@@ -1053,8 +1119,8 @@ session_stop() {
         stop_master
         rm -f "$FORWARDS_FILE" "$CONFLICTS_FILE"
         # No directory is up, so any devhost sync Mutagen still has is a leftover.
-        if sync_enabled && mutagen_available; then
-            with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate --label-selector devhost=1 >/dev/null 2>&1 || true
+        if [[ $keep_sync -eq 0 ]] && sync_enabled && mutagen_available; then
+            terminate_all_syncs
         fi
     fi
 }
@@ -1140,6 +1206,9 @@ cmd_flush() {
     init_state
     resolve_target
     session_registered || die "$PWD is not up (run: devhost up)"
+    if sync_enabled && ! sync_exists; then
+        die "no sync session for $PWD (mutagen lost it?); run 'devhost down' and 'devhost up' again"
+    fi
     flush_sync || die "flush failed: local changes or outputs may not have been synced"
     log "flushed"
     check_conflicts
@@ -1196,16 +1265,18 @@ run_conflicts_ok() {
 RUN_MODE=""
 RUN_DONE=0
 RUN_STARTING=0      # inside session_start: nothing is registered yet
+RUN_REGISTERED=0    # this run is registered under the session
 RUN_CHILD=""        # pid of the command while it runs
 RUN_INTERRUPTED=0
 RUN_TERM_SENT=0
 
-# Signals while the command runs. A terminal's Ctrl-C has already reached
-# the command (same process group), so INT is only noted, never forwarded: a
-# second INT would make e.g. `docker compose up` force-kill instead of
-# stopping cleanly. TERM and HUP (timeout, CI cancel, closed terminal) are
-# passed on to the command once. Before the command starts, any of them
-# aborts the startup; the EXIT trap cleans up.
+# Signals while the command runs. A terminal's Ctrl-C reaches the command
+# directly (same process group, default disposition restored in cmd_run),
+# so INT is only noted, never forwarded: a second INT would make e.g.
+# `docker compose up` force-kill instead of stopping cleanly. TERM and HUP
+# (timeout, CI cancel, closed terminal) are passed on to the command once.
+# Before the command starts, any of them aborts the startup; the EXIT trap
+# cleans up.
 on_run_signal() {
     local sig="$1" code="$2"
     RUN_INTERRUPTED=1
@@ -1221,13 +1292,16 @@ run_cleanup() {
     [[ $RUN_DONE -eq 0 ]] || return 0
     RUN_DONE=1
     trap '' INT TERM HUP      # teardown finishes even if Ctrl-C is pressed again
-    lock_acquire
     if [[ $RUN_STARTING -eq 1 ]]; then
         # Interrupted while the session was being set up: undo what started.
+        lock_acquire
         abandon_session
         lock_release
         return 0
     fi
+    # Interrupted before anything was ours (e.g. still waiting for the lock).
+    [[ $RUN_REGISTERED -eq 1 ]] || return 0
+    lock_acquire
     unregister_run
     if [[ "$RUN_MODE" == run && "$(session_mode)" == run ]] && ! other_runs_alive; then
         teardown=1     # last run out of a run-started session tears it down
@@ -1243,13 +1317,15 @@ run_cleanup() {
 }
 
 cmd_run() {
-    local rc=0 mode snapshot pre
+    local rc=0 prev=0 mode snapshot pre
     [[ "${1:-}" == "--" ]] && shift
     [[ $# -gt 0 ]] || die "usage: devhost run [--] <command...>"
     check_conflict_mode
     init_state
     resolve_target
-    trap 'run_cleanup' EXIT
+    pre="$STATE_DIR/conflicts.pre.$$"
+    snapshot="$STATE_DIR/conflicts.run.$$"
+    trap 'run_cleanup; rm -f "$STATE_DIR/conflicts.pre.$$" "$STATE_DIR/conflicts.run.$$"' EXIT
     trap 'on_run_signal INT 130' INT
     trap 'on_run_signal TERM 143' TERM
     trap 'on_run_signal HUP 129' HUP
@@ -1261,30 +1337,36 @@ cmd_run() {
         RUN_STARTING=1
         session_start "$mode" || exit 1
         RUN_STARTING=0
-        RUN_MODE="$mode"
+        RUN_MODE="$STARTED_MODE"
     fi
     register_run
+    RUN_REGISTERED=1
     lock_release
-    pre="$STATE_DIR/conflicts.pre.$$"
     precheck_conflicts "$pre" || exit 1
     # The command must not run against a half-synced checkout on the VM.
     flush_sync || { log "not running the command: the checkout is not fully synced"; exit 1; }
     # Run the command as a background job and wait for it, so signals reach
     # this shell while it runs (a foreground child would hold them until it
-    # exits); <&0 keeps the command's stdin, which `&` would otherwise drop.
-    DOCKER_CONTEXT="$CONTEXT" "$@" <&0 &
+    # exits). bash starts background jobs with INT and QUIT ignored; the
+    # subshell restores them so Ctrl-C reaches the command as usual. <&0
+    # keeps the command's stdin, which `&` would otherwise drop.
+    ( trap - INT QUIT; DOCKER_CONTEXT="$CONTEXT" exec "$@" ) <&0 &
     RUN_CHILD=$!
     while :; do
         RUN_INTERRUPTED=0
         rc=0
         wait "$RUN_CHILD" 2>/dev/null || rc=$?
-        if [[ $RUN_INTERRUPTED -eq 0 ]] || ! pid_alive "$RUN_CHILD"; then
-            break      # the command is done; an interrupted wait tries again
+        [[ $RUN_INTERRUPTED -eq 1 ]] || break   # the command is done
+        # The status above is the signal's, not the command's: wait again.
+        # 127 means the command was already collected by an earlier wait.
+        if [[ $rc -eq 127 ]]; then
+            rc=$prev
+            break
         fi
+        prev=$rc
     done
     RUN_CHILD=""
     # Keep the conflicts recorded meanwhile: teardown deletes the live file.
-    snapshot="$STATE_DIR/conflicts.run.$$"
     cp -f "$CONFLICTS_FILE" "$snapshot" 2>/dev/null || : > "$snapshot"
     # Flushes outputs back (also when the command failed); the last run of a
     # run-started session also tears it down.
@@ -1364,9 +1446,6 @@ main() {
     set -euo pipefail
     local cmd="${1:-}"
     [[ $# -gt 0 ]] && shift
-    # Sessions and syncs are keyed by the physical path, so a checkout reached
-    # through a symlink (macOS /tmp -> /private/tmp) is the same checkout.
-    cd -P . 2>/dev/null || true
     case "$cmd" in
         run)        cmd_run "$@" ;;
         up)         cmd_up ;;

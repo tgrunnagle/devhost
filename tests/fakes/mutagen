@@ -4,6 +4,7 @@
 #   mutagen-alphas       lines "NAME ALPHA-PATH" for those sessions
 #   mutagen-status       text printed by `sync list <name>` (e.g. a permission problem)
 #   mutagen-flush-hang   if present, `sync flush` blocks for 30s (VM gone away)
+#   mutagen-flush-fail   if present, `sync flush` exits 1 (session has problems)
 #   mutagen-create-hang  if present, `sync create` blocks for 30s before creating
 # `list` and `terminate` accept a name or `--label-selector devhost=1` (all).
 # Every invocation is appended to $FAKE_DIR/mutagen.log.
@@ -20,7 +21,7 @@ shift 2
 # Prints one session in the shape of `mutagen sync list`.
 describe() {
     local name="$1" alpha
-    alpha="$(awk -v n="$name" '$1 == n { print $2; exit }' "$alphas")"
+    alpha="$(awk -v n="$name" '$1 == n { sub(/^[^ ]+ /, ""); print; exit }' "$alphas")"
     echo "--------------------------------------------------------------------------------"
     echo "Name: $name"
     echo "Labels: devhost: 1"
@@ -64,6 +65,10 @@ case "$sub" in
         grep -qx "${1:-}" "$sessions" || exit 1
         if [[ -f "$FAKE_DIR/mutagen-flush-hang" ]]; then
             sleep 30
+        fi
+        if [[ -f "$FAKE_DIR/mutagen-flush-fail" ]]; then
+            echo "Error: session has problems" >&2
+            exit 1
         fi
         ;;
     terminate)

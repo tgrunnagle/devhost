@@ -6,6 +6,9 @@
 # Requires the Docker CLI and an SSH key the host already trusts (see
 # guest/add-dev-user.sh). The key must load without a prompt (ssh-agent or no
 # passphrase), because Docker can't answer SSH prompts.
+#
+# ADD_SSH_CONFIG=1 adds the recommended ~/.ssh/config block without asking
+# (for scripted setups; interactively the script asks).
 set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
@@ -60,13 +63,17 @@ add_block() {
     chmod 0700 "$HOME/.ssh"
     touch "$ssh_config"
     tmp="$(mktemp "$ssh_config.XXXXXX")"
-    awk -v block="$block" '
+    # The block reaches awk through the environment: macOS (BWK) awk rejects
+    # a multi-line -v value.
+    BLOCK="$block" awk '
+        BEGIN { block = ENVIRON["BLOCK"] }
         !done && ((tolower($1) == "host" && $2 == "*") || tolower($1) == "match") {
             print block; print ""; done = 1
         }
         { print }
         END { if (!done) { if (NR > 0) print ""; print block } }' "$ssh_config" > "$tmp"
-    mv "$tmp" "$ssh_config"
+    cat "$tmp" > "$ssh_config"     # written in place: the config may be a symlink
+    rm -f "$tmp"
     chmod 0600 "$ssh_config"
 }
 
@@ -76,7 +83,9 @@ if has_host_block; then
     printf '    %s\n' "${block//$'\n'/$'\n'    }"
 else
     answer=n
-    if [[ -t 0 ]]; then
+    if [[ "${ADD_SSH_CONFIG:-}" == 1 ]]; then
+        answer=y
+    elif [[ -t 0 ]]; then
         read -r -p "==> Add the recommended block for $host to $ssh_config? [y/N] " answer
     fi
     if [[ "$answer" =~ ^[Yy]$ ]]; then

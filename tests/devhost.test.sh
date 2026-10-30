@@ -63,6 +63,9 @@ teardown() {
     rm -rf "$TMP"
 }
 
+# The Mutagen label devhost puts on this state directory's sessions.
+state_label() { echo "devhost-state=$(printf '%s' "$DEVHOST_STATE_DIR" | cksum | cut -d' ' -f1)"; }
+
 # Sources the script's functions (main is not run) with a resolved target,
 # under the shell options main sets, so pipelines fail as they would in use.
 load() {
@@ -422,7 +425,7 @@ test_sync_create_uses_same_absolute_path() {
     load
     start_sync 2>/dev/null
     assert_file_has "$FAKE_DIR/ssh.log" "ssh-remote mkdir -p $PWD" "remote dir created"
-    assert_file_has "$FAKE_DIR/mutagen.log" "sync create --name $(sync_name) --label devhost=1 --sync-mode two-way-resolved --ignore node_modules --ignore .git --ignore .venv --ignore target --ignore dist $PWD alice@devhost:$PWD" "mutagen session"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync create --name $(sync_name) --label devhost=1 --label $(state_label) --sync-mode two-way-resolved --ignore node_modules --ignore .git --ignore .venv --ignore target --ignore dist $PWD alice@devhost:$PWD" "mutagen session"
     FAKE_ENDPOINT="alice@devhost:2222" resolve_target
     assert_eq "$(sync_beta_url)" "alice@devhost:2222:$PWD" "beta url with port"
 }
@@ -732,7 +735,7 @@ test_sync_primes_vm_from_laptop_first() {
     start_sync 2>/dev/null
     local name l1 l2 l3 l4 l5
     name="$(sync_name)"
-    assert_file_has "$FAKE_DIR/mutagen.log" "sync create --name $name-prime --label devhost=1 --sync-mode one-way-replica --ignore node_modules --ignore .git --ignore .venv --ignore target --ignore dist $PWD alice@devhost:$PWD" "one-way replica from the laptop, same ignores"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync create --name $name-prime --label devhost=1 --label $(state_label) --sync-mode one-way-replica --ignore node_modules --ignore .git --ignore .venv --ignore target --ignore dist $PWD alice@devhost:$PWD" "one-way replica from the laptop, same ignores"
     l1="$(grep -n -- "sync create --name $name-prime" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
     l2="$(grep -n -- "sync flush $name-prime" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
     l3="$(grep -n -- "sync terminate $name-prime" "$FAKE_DIR/mutagen.log" | cut -d: -f1)"
@@ -791,7 +794,7 @@ test_last_down_terminates_leftover_syncs() {
     status="$(run_devhost status 2>/dev/null)"
     [[ "$status" == *"other devhost syncs"*"$TMP/old-checkout"* ]] || fail "status lists other devhost syncs: $status"
     run_devhost down 2>/dev/null || fail "down"
-    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate --label-selector devhost=1" "leftovers go with the last session"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate --label-selector $(state_label)" "leftovers of this state dir go with the last session"
     assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "no devhost sync left"
 }
 
@@ -880,6 +883,164 @@ test_probe_deadline() {
     load
     with_deadline 1 sleep 5 || rc=$?
     assert_eq "$rc" "124" "deadline kills a hung command"
+}
+
+test_ctrl_c_reaches_command() {
+    : > "$FAKE_DIR/ps"
+    local pid rc=0
+    # Job control on: the background devhost (and so its command) keeps the
+    # default INT disposition, as it would from a terminal. INT to its process
+    # group is what Ctrl-C does.
+    set -m
+    # shellcheck disable=SC2016
+    start_devhost run -- sh -c 'trap "echo int > \"$FAKE_DIR/child-got-int\"; exit 5" INT; touch "$FAKE_DIR/child-started"; while :; do sleep 0.1; done'
+    pid=$!
+    set +m
+    wait_for 30 "the command to start" test -e "$FAKE_DIR/child-started"
+    kill -INT -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_exists "$FAKE_DIR/child-got-int" "Ctrl-C reached the command"
+    assert_eq "$rc" "5" "exit code is the command's"
+    assert_missing "$FAKE_DIR/master" "torn down"
+    assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder stopped"
+}
+
+test_symlinked_checkout_syncs_logical_path() {
+    load
+    if ! ln -s "$PROJECT" "$TMP/link" 2>/dev/null || [[ ! -L "$TMP/link" ]]; then
+        echo "       (no symlinks on this filesystem; skipped)"
+        return 0
+    fi
+    cd "$TMP/link" || exit 1
+    start_sync 2>/dev/null
+    assert_file_has "$FAKE_DIR/mutagen.log" "--sync-mode two-way-resolved $TMP/link alice@devhost:$TMP/link" "the sync uses the path as typed: what -v \$PWD expands to"
+    assert_eq "$(sync_name)" "devhost-$(printf '%s' "$PROJECT" | cksum | cut -d' ' -f1)" "but is keyed by the physical path"
+    cd "$PROJECT" || exit 1
+    start_sync 2>/dev/null
+    assert_eq "$(grep -c 'sync create --name' "$FAKE_DIR/mutagen.log")" "2" "entered directly, it is the same checkout: no new session (prime + two-way only)"
+}
+
+test_sync_alphas_keep_spaces() {
+    load
+    echo "devhost-x" > "$FAKE_DIR/mutagen-sessions"
+    echo "devhost-x $TMP/my dir" > "$FAKE_DIR/mutagen-alphas"
+    assert_eq "$(devhost_sync_alphas)" "$TMP/my dir" "paths with spaces survive"
+}
+
+test_prime_failure_is_fatal_and_leftover_prime_removed() {
+    load
+    local name out rc=0
+    name="$(sync_name)"
+    echo "$name-prime" > "$FAKE_DIR/mutagen-sessions"          # left by an interrupted start
+    echo "$name-prime $PWD" > "$FAKE_DIR/mutagen-alphas"
+    touch "$FAKE_DIR/mutagen-flush-fail"
+    out="$(start_sync 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "start_sync fails when the replica could not make the VM match"
+    [[ "$out" == *"could not be updated or removed"* ]] || fail "says why: $out"
+    assert_eq "$(grep -c -- "sync terminate $name-prime" "$FAKE_DIR/mutagen.log")" "2" "leftover prime terminated before, the failed one after"
+    assert_file_lacks "$FAKE_DIR/mutagen.log" "sync create --name $name --label" "no two-way session over a VM copy that doesn't match"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "nothing left running"
+}
+
+test_interrupted_priming_leaves_no_prime_session() {
+    : > "$FAKE_DIR/ps"
+    touch "$FAKE_DIR/mutagen-flush-hang"               # the priming flush never finishes
+    local pid rc=0
+    start_devhost run -- true
+    pid=$!
+    wait_for 30 "priming to start" grep -q -- '-prime' "$FAKE_DIR/mutagen.log"
+    kill -TERM "$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$rc" "143" "run exits on the signal"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "the one-way replica is not left deleting VM files"
+    assert_missing "$FAKE_DIR/master" "torn down"
+}
+
+test_failed_final_flush_keeps_sync() {
+    : > "$FAKE_DIR/ps"
+    local out rc=0 name
+    name="devhost-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    # shellcheck disable=SC2016
+    out="$(DEVHOST_FLUSH_TIMEOUT=1 run_devhost run -- sh -c 'touch "$FAKE_DIR/mutagen-flush-hang"' 2>&1)" || rc=$?
+    assert_eq "$rc" "0" "the command's exit code wins"
+    [[ "$out" == *"keeping the sync session"* ]] || fail "explains why the session stays: $out"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "$name" "sync kept so VM-side outputs are not lost"
+    assert_missing "$FAKE_DIR/master" "forwarder and master stopped anyway"
+    rm -f "$FAKE_DIR/mutagen-flush-hang"
+    run_devhost up 2>/dev/null || fail "up"
+    assert_eq "$(grep -c -- "sync create --name $name-prime" "$FAKE_DIR/mutagen.log")" "1" "the kept session is reused: no second priming"
+    run_devhost down 2>/dev/null || fail "down"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "gone after a successful flush"
+}
+
+test_interrupt_while_waiting_for_lock_does_not_hang() {
+    : > "$FAKE_DIR/ps"
+    local holder pid rc=0 start end
+    sleep 60 &
+    holder=$!
+    mkdir -p "$DEVHOST_STATE_DIR/lock"
+    echo "$holder" > "$DEVHOST_STATE_DIR/lock/pid"      # a live holder
+    start_devhost run -- true
+    pid=$!
+    sleep 1
+    start=$(date +%s)
+    kill -TERM "$pid"
+    wait "$pid" || rc=$?
+    end=$(date +%s)
+    kill "$holder" 2>/dev/null || true
+    assert_eq "$rc" "143" "run exits on the signal"
+    [[ $((end - start)) -le 3 ]] || fail "took $((end - start))s to exit while the lock was held"
+    assert_eq "$(ls "$DEVHOST_STATE_DIR/sessions" 2>/dev/null)" "" "nothing registered"
+}
+
+test_flush_fails_without_sync_session() {
+    : > "$FAKE_DIR/ps"
+    run_devhost up 2>/dev/null || fail "up"
+    : > "$FAKE_DIR/mutagen-sessions"                   # mutagen lost the session
+    : > "$FAKE_DIR/mutagen-alphas"
+    local rc=0
+    run_devhost flush 2>/dev/null || rc=$?
+    assert_eq "$rc" "1" "flush fails rather than claiming success"
+    run_devhost down 2>/dev/null || fail "down"
+}
+
+test_initial_sync_does_not_hold_the_global_lock() {
+    : > "$FAKE_DIR/ps"
+    touch "$FAKE_DIR/mutagen-flush-hang"
+    mkdir -p "$TMP/other"
+    local pid rc=0 start end
+    DEVHOST_SYNC_TIMEOUT=20 start_devhost up           # stuck in its initial sync for 20s
+    pid=$!
+    wait_for 30 "the first up to reach its initial flush" grep -q "sync flush" "$FAKE_DIR/mutagen.log"
+    start=$(date +%s)
+    (cd "$TMP/other" && DEVHOST_NO_SYNC=1 run_devhost run -- true 2>/dev/null) || fail "run elsewhere"
+    end=$(date +%s)
+    [[ $((end - start)) -le 10 ]] || fail "a run elsewhere waited $((end - start))s on the global lock"
+    wait "$pid" || rc=$?
+    assert_eq "$rc" "1" "the stuck up fails on its timeout"
+    assert_missing "$FAKE_DIR/master" "everything torn down"
+}
+
+test_add_devhost_context_inserts_ssh_block() {
+    local home="$TMP/home" cfg block_line star_line
+    mkdir -p "$home/.ssh"
+    cfg="$home/.ssh/config"
+    printf 'Host *\n    ControlMaster no\n' > "$cfg"
+    HOME="$home" ADD_SSH_CONFIG=1 "$ROOT/client/add-devhost-context.sh" devhost.lan alice > "$TMP/out" 2>&1 ||
+        fail "script failed: $(cat "$TMP/out")"
+    assert_file_has "$FAKE_DIR/docker.log" "context update devhost --docker host=ssh://alice@devhost.lan" "context pointed at the host"
+    block_line="$(grep -n '^Host devhost.lan$' "$cfg" | cut -d: -f1)"
+    star_line="$(grep -n '^Host \*$' "$cfg" | cut -d: -f1)"
+    [[ -n "$block_line" && -n "$star_line" && $block_line -lt $star_line ]] || fail "block ahead of 'Host *': $(cat "$cfg")"
+    assert_file_has "$cfg" "    ControlPath ~/.ssh/cm-%r@%h:%p" "block content intact"
+    assert_file_has "$cfg" "    ControlMaster no" "existing block intact"
+    HOME="$home" ADD_SSH_CONFIG=1 "$ROOT/client/add-devhost-context.sh" devhost.lan alice > "$TMP/out2" 2>&1 ||
+        fail "second run failed: $(cat "$TMP/out2")"
+    assert_eq "$(grep -c '^Host devhost.lan$' "$cfg")" "1" "not added twice"
+    grep -q "already has a block" "$TMP/out2" || fail "second run reports the existing block: $(cat "$TMP/out2")"
+    HOME="$home" ADD_SSH_CONFIG=1 "$ROOT/client/add-devhost-context.sh" devhostXlan alice > "$TMP/out3" 2>&1 ||
+        fail "third run failed: $(cat "$TMP/out3")"
+    assert_eq "$(grep -c '^Host devhostXlan$' "$cfg")" "1" "a dot in the existing host is not a wildcard"
 }
 
 # ------------------------------------------------------------------ runner
