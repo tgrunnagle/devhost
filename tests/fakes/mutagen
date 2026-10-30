@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Fake mutagen for tests. State in $FAKE_DIR:
+#   mutagen-sessions   names of existing sessions, one per line
+#   mutagen-status     text printed by `sync list <name>` (e.g. a permission problem)
+# Every invocation is appended to $FAKE_DIR/mutagen.log.
+set -u
+echo "mutagen $*" >> "$FAKE_DIR/mutagen.log"
+sessions="$FAKE_DIR/mutagen-sessions"
+touch "$sessions"
+
+[[ "${1:-}" == sync ]] || { echo "fake mutagen: unsupported: $*" >&2; exit 1; }
+sub="${2:-}"
+shift 2
+
+case "$sub" in
+    create)
+        name=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --name) name="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        echo "$name" >> "$sessions"
+        echo "Created session $name"
+        ;;
+    list)
+        name="${1:-}"
+        grep -qx "$name" "$sessions" || { echo "Error: unable to locate requested sessions" >&2; exit 1; }
+        echo "Name: $name"
+        cat "$FAKE_DIR/mutagen-status" 2>/dev/null || echo "Status: Watching for changes"
+        ;;
+    flush)
+        grep -qx "${1:-}" "$sessions" || exit 1
+        ;;
+    terminate)
+        grep -v -x "${1:-}" "$sessions" > "$sessions.tmp" || true
+        mv "$sessions.tmp" "$sessions"
+        ;;
+    *)
+        echo "fake mutagen: unsupported: sync $sub $*" >&2
+        exit 1
+        ;;
+esac

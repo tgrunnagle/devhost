@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Fake ssh for tests. State lives in $FAKE_DIR:
+#   master            exists while a control master is "running"
+#   ssh-down          if present, connections fail after 1s like a saved VM
+#   ssh-fail-ports    host ports for which `-O forward` fails (one per line)
+# Every invocation is appended to $FAKE_DIR/ssh.log.
+set -u
+echo "ssh $*" >> "$FAKE_DIR/ssh.log"
+
+mode="" ctl="" fwd="" master_flag=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -O) ctl="$2"; shift 2 ;;
+        -L) fwd="$2"; shift 2 ;;
+        -M) master_flag=1; shift ;;
+        -o|-S|-p) shift 2 ;;
+        -N|-f) shift ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+mode="$ctl"
+
+if [[ -n "$mode" ]]; then
+    case "$mode" in
+        check)
+            [[ -f "$FAKE_DIR/master" ]] && exit 0
+            echo "Control socket connect: No such file or directory" >&2
+            exit 255
+            ;;
+        exit)
+            rm -f "$FAKE_DIR/master"
+            exit 0
+            ;;
+        forward)
+            port="${fwd#127.0.0.1:}"
+            port="${port%%:*}"
+            if [[ -f "$FAKE_DIR/ssh-fail-ports" ]] && grep -qx "$port" "$FAKE_DIR/ssh-fail-ports"; then
+                echo "mux_client_forward: forwarding request failed" >&2
+                exit 255
+            fi
+            exit 0
+            ;;
+        cancel)
+            exit 0
+            ;;
+    esac
+fi
+
+if [[ -f "$FAKE_DIR/ssh-down" ]]; then
+    sleep 1
+    echo "ssh: connect to host devhost port 22: Operation timed out" >&2
+    exit 255
+fi
+
+if [[ $master_flag -eq 1 ]]; then
+    touch "$FAKE_DIR/master"
+    exit 0
+fi
+
+# Remote command: "$1" is the target, the rest is the command.
+shift
+echo "ssh-remote $*" >> "$FAKE_DIR/ssh.log"
+case "$*" in
+    "docker version"*) echo "27.0.0" ;;
+esac
+exit 0

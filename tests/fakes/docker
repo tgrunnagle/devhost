@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Fake docker CLI for tests. Behaviour is driven by files in $FAKE_DIR:
+#   ps            lines "CONTAINER_ID NAME" of running containers
+#   port.<id>     `docker port <id>` output for that container
+#   events        lines "ACTION ID NAME" to emit from `docker events`
+#   events-hold   seconds to keep `docker events` open after emitting (default 30)
+#   unreachable   if present, every command fails like a dead daemon
+# Every invocation is appended to $FAKE_DIR/docker.log.
+set -u
+echo "docker $*" >> "$FAKE_DIR/docker.log"
+
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --context) shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+
+if [[ -f "$FAKE_DIR/unreachable" && "${args[0]}" != context ]]; then
+    echo "error during connect: dial tcp: connection refused" >&2
+    exit 1
+fi
+
+case "${args[0]}" in
+    context)
+        echo "ssh://${FAKE_ENDPOINT:-alice@devhost}"
+        ;;
+    ps)
+        cat "$FAKE_DIR/ps" 2>/dev/null || true
+        ;;
+    port)
+        cat "$FAKE_DIR/port.${args[1]}" 2>/dev/null || true
+        ;;
+    events)
+        cat "$FAKE_DIR/events" 2>/dev/null || true
+        sleep "$(cat "$FAKE_DIR/events-hold" 2>/dev/null || echo 30)"
+        ;;
+    version)
+        echo "27.0.0"
+        ;;
+    *)
+        echo "fake docker: unsupported: ${args[*]}" >&2
+        exit 1
+        ;;
+esac
