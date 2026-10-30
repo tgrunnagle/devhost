@@ -16,7 +16,7 @@
 #   devhost down                    stop them (forwarder stops when no dir is up)
 #   devhost flush                   push local changes / pull outputs now
 #   devhost status                  reachable? forwards? sync state?
-#   devhost probe                   exit 0 if the daemon answers within ~3s
+#   devhost probe                   exit 0 if the daemon answers, 1 within 5s if not
 #
 # Environment:
 #   DEVHOST_CONTEXT        Docker context to use (default: devhost)
@@ -24,6 +24,10 @@
 #   DEVHOST_STATE_DIR      state directory (default: ~/.devhost)
 #   DEVHOST_NO_SYNC=1      mirror ports only, skip the Mutagen sync
 #   DEVHOST_FLUSH_TIMEOUT  seconds to wait for a sync flush (default: 60)
+#   DEVHOST_CONFLICTS      what a port that can't be mirrored does to `run`:
+#                          auto (default) fails it only for containers that
+#                          appeared while the command ran; fail: any conflict
+#                          fails it; warn: none does
 #
 # Requires: bash, ssh (OpenSSH), docker CLI, mutagen (unless DEVHOST_NO_SYNC=1).
 # Works with bash 3.2 (macOS). Tested with fake docker/ssh/mutagen in tests/.
@@ -31,14 +35,18 @@
 CONTEXT="${DEVHOST_CONTEXT:-devhost}"
 STATE_DIR="${DEVHOST_STATE_DIR:-$HOME/.devhost}"
 FLUSH_TIMEOUT="${DEVHOST_FLUSH_TIMEOUT:-60}"
+CONFLICT_MODE="${DEVHOST_CONFLICTS:-auto}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 SOCK="$STATE_DIR/ssh.sock"
 LOCK_DIR="$STATE_DIR/lock"                 # mkdir lock around state transitions
+MASTER_LOCK="$STATE_DIR/master.lock"       # mkdir lock around opening the master
 FORWARDS_FILE="$STATE_DIR/forwards"        # lines: PORT VM_ADDR CONTAINER_ID NAME
 CONFLICTS_FILE="$STATE_DIR/conflicts"      # lines: PORT|CONTAINER_ID|NAME|REASON
+MASTER_PID_FILE="$STATE_DIR/master.pid"    # the master the forwards were opened on
 FWD_PID_FILE="$STATE_DIR/forwarder.pid"
 FWD_READY_FILE="$STATE_DIR/forwarder.ready"
+FWD_STREAM_FILE="$STATE_DIR/forwarder.stream"   # exists while the event stream runs
 FWD_GEN_FILE="$STATE_DIR/forwarder.reconciled"   # counter, bumped after each reconcile
 FWD_LOG="$STATE_DIR/forwarder.log"
 SESSIONS_DIR="$STATE_DIR/sessions"         # <id>: "PWD\nMODE" (up|run); <id>.runs/<pid>
@@ -105,41 +113,52 @@ kill_tree() {
 
 pid_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
 
-# Serialises up/down across concurrent invocations (mkdir is atomic; macOS has
-# no flock). Re-entrant for the holding process. Waits as long as the holder is
-# alive; a lock whose holder died (or that never got a pid and is old) is
-# reclaimed by renaming it first, so only one waiter wins.
+# Serialises state transitions across concurrent invocations (mkdir is atomic;
+# macOS has no flock). $1 is the lock directory (default: the global lock).
+# Re-entrant for the holding process. Waits as long as the holder is alive; a
+# lock whose holder died (or that never got a pid and is old) is reclaimed by
+# renaming it first, so only one waiter wins.
 lock_acquire() {
-    local ticks=0 owner stale
-    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    local dir="${1:-$LOCK_DIR}" ticks=0 owner stale stale_dir taken
+    while ! mkdir "$dir" 2>/dev/null; do
+        owner="$(cat "$dir/pid" 2>/dev/null || true)"
         if [[ "$owner" == "$$" ]]; then
             return 0
         fi
         stale=0
         if [[ -n "$owner" ]]; then
             pid_alive "$owner" || stale=1
-        elif [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+        elif [[ -n "$(find "$dir" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
             stale=1
         fi
         if [[ $stale -eq 1 ]]; then
-            if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
-                rm -rf "$LOCK_DIR.stale.$$"
+            stale_dir="$dir.stale.$$"
+            if mv "$dir" "$stale_dir" 2>/dev/null; then
+                # Between judging the holder dead and the rename, another
+                # waiter may have reclaimed the lock and a third process taken
+                # it: then a live lock was just renamed. Give it back.
+                taken="$(cat "$stale_dir/pid" 2>/dev/null || true)"
+                if [[ -n "$taken" && "$taken" != "$owner" ]] && pid_alive "$taken"; then
+                    mv "$stale_dir" "$dir" 2>/dev/null || rm -rf "$stale_dir"
+                else
+                    rm -rf "$stale_dir"
+                fi
             fi
             continue
         fi
         if [[ $((ticks % 300)) -eq 299 ]]; then
-            log "waiting for another devhost command (pid ${owner:-?}) to finish..."
+            log "waiting for another devhost process (pid ${owner:-?}) to finish..."
         fi
         sleep 0.1
         ticks=$((ticks + 1))
     done
-    echo "$$" > "$LOCK_DIR/pid"
+    echo "$$" > "$dir/pid"
 }
 
 lock_release() {
-    if [[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" == "$$" ]]; then
-        rm -rf "$LOCK_DIR"
+    local dir="${1:-$LOCK_DIR}"
+    if [[ "$(cat "$dir/pid" 2>/dev/null)" == "$$" ]]; then
+        rm -rf "$dir"
     fi
 }
 
@@ -152,7 +171,7 @@ resolve_target() {
         endpoint="ssh://$DEVHOST_SSH"
     else
         endpoint="$(docker context inspect "$CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" ||
-            die "Docker context '$CONTEXT' not found. Run client/add-devhost-context.sh first."
+            die "Docker context '$CONTEXT' not found. Run client/add-devhost-context.sh first, or set DEVHOST_CONTEXT to the name you gave it."
     fi
     parse_ssh_endpoint "$endpoint"
 }
@@ -177,10 +196,33 @@ ssh_port_opts() {
     if [[ -n "$SSH_PORT" ]]; then printf -- '-p\n%s\n' "$SSH_PORT"; fi
 }
 
+# The user ssh will log in as: ssh's own resolution (config, user@ in the
+# target), falling back to the target or the local user.
+ssh_user() {
+    local user
+    # shellcheck disable=SC2046
+    user="$(ssh $(ssh_port_opts) -G "$TARGET" 2>/dev/null | awk '$1 == "user" { print $2; exit }')"
+    if [[ -z "$user" ]]; then
+        if [[ "$TARGET" == *@* ]]; then user="${TARGET%%@*}"; else user="${USER:-$(id -un)}"; fi
+    fi
+    echo "$user"
+}
+
 # ssh through the helper's own control master.
 mux_ssh() {
     # shellcheck disable=SC2046  # ssh_port_opts prints zero or two words
     ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -S "$SOCK" "$@"
+}
+
+# Runs a docker CLI command on the VM through the control master, so the
+# forwarder's calls share the keepalive-guarded connection its forwards live
+# on and don't pay a fresh SSH handshake each.
+remote_docker() {
+    local cmd="docker" arg
+    for arg in "$@"; do
+        cmd="$cmd $(printf '%q' "$arg")"
+    done
+    mux_ssh -n "$TARGET" "$cmd"
 }
 
 master_running() { mux_ssh -O check "$TARGET" >/dev/null 2>&1; }
@@ -190,24 +232,37 @@ master_pid() {
     mux_ssh -O check "$TARGET" 2>&1 | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -n 1
 }
 
+MASTER_STARTED=0   # set by start_master when it opened a new master
+
 start_master() {
+    MASTER_STARTED=0
     if master_running; then
+        return 0
+    fi
+    # A reconnecting forwarder and a command starting a session can both find
+    # the master gone; only one of them may open the new one.
+    lock_acquire "$MASTER_LOCK"
+    if master_running; then
+        lock_release "$MASTER_LOCK"
         return 0
     fi
     rm -f "$SOCK"
     # shellcheck disable=SC2046
-    ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=5 -o ControlPersist=yes \
-        -M -N -f -S "$SOCK" "$TARGET" || {
+    if ! ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=5 -o ControlPersist=yes \
+            -M -N -f -S "$SOCK" "$TARGET"; then
+        lock_release "$MASTER_LOCK"
         log "could not open SSH connection to $TARGET"
         return 1
-    }
+    fi
+    MASTER_STARTED=1
+    lock_release "$MASTER_LOCK"
 }
 
 stop_master() {
     if master_running; then
         mux_ssh -O exit "$TARGET" >/dev/null 2>&1 || true
     fi
-    rm -f "$SOCK"
+    rm -f "$SOCK" "$MASTER_PID_FILE"
 }
 
 daemon_reachable() {
@@ -217,42 +272,76 @@ daemon_reachable() {
 # ----------------------------------------------------------- port parsing
 
 # stdin: output of `docker port <id>`; stdout: "PORT ADDR" per host TCP port,
-# deduplicated on PORT. ADDR is where to connect on the VM: the VM's loopback
-# for wildcard/loopback bindings, otherwise the specific interface address.
-# UDP can't go through an SSH forward and is skipped.
+# deduplicated on PORT. ADDR is where to connect on the VM: its IPv4 loopback
+# for 0.0.0.0/127.0.0.1 bindings, ::1 for IPv6-only loopback/wildcard
+# bindings, otherwise the specific interface address. UDP can't go through
+# an SSH forward and is skipped.
 parse_published_ports() {
-    local cport arrow addr port host
-    while read -r cport arrow addr; do
-        [[ "$arrow" == '->' ]] || continue
-        [[ "$cport" == */tcp ]] || continue
-        port="${addr##*:}"
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        host="${addr%:*}"
-        host="${host#[}"
-        host="${host%]}"
-        case "$host" in
-            0.0.0.0|::|127.0.0.1|::1|'') host=127.0.0.1 ;;
-        esac
-        echo "$port $host"
-    done | sort -un -k1,1
+    awk '
+        function rank(h) {
+            if (h == "127.0.0.1") return 0
+            if (h == "::1") return 2
+            if (h == "::") return 3
+            return 1
+        }
+        $2 == "->" && $1 ~ /\/tcp$/ {
+            addr = $3
+            port = addr
+            sub(/.*:/, "", port)
+            if (port !~ /^[0-9]+$/) next
+            host = substr(addr, 1, length(addr) - length(port) - 1)
+            gsub(/^\[|\]$/, "", host)
+            if (host == "0.0.0.0" || host == "") host = "127.0.0.1"
+            if (!(port in pick) || rank(host) < rank(pick[port])) pick[port] = host
+        }
+        END {
+            for (port in pick) {
+                host = pick[port]
+                if (host == "::") host = "::1"   # IPv6 wildcard without an IPv4 one
+                print port, host
+            }
+        }' | sort -un -k1,1
+}
+
+LISTENERS=""        # "PORT COMMAND PID" per local TCP listener (snapshot_listeners)
+LISTENERS_FRESH=0   # set while a caller has already taken the snapshot
+
+# Takes one snapshot of what listens on the laptop: one lsof/ss call per
+# container (or reconcile) rather than one per port.
+snapshot_listeners() {
+    # `|| true`: lsof exits 1 when nothing listens, which is not an error here.
+    if command -v lsof >/dev/null 2>&1; then
+        LISTENERS="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null |
+            awk 'NR > 1 { n = split($9, a, ":"); print a[n], $1, $2 }' || true)"
+    elif command -v ss >/dev/null 2>&1; then
+        LISTENERS="$(ss -ltnpH 2>/dev/null | awk '{
+            n = split($4, a, ":"); port = a[n]; cmd = ""; pid = ""
+            if (match($0, /users:\(\("[^"]*",pid=[0-9]+/)) {
+                s = substr($0, RSTART + 9, RLENGTH - 9)
+                split(s, b, "\",pid=")
+                cmd = b[1]; pid = b[2]
+            }
+            print port, cmd, pid
+        }' || true)"
+    else
+        LISTENERS=""
+    fi
 }
 
 # Prints what listens on 127.0.0.1:$1 on the laptop ("COMMAND (pid N)"), or
 # nothing if lsof/ss don't know of a listener.
 port_holder() {
-    local port="$1"
-    if command -v lsof >/dev/null 2>&1; then
-        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null |
-            awk 'NR == 2 { printf "%s (pid %s)\n", $1, $2 }'
-    elif command -v ss >/dev/null 2>&1; then
-        ss -ltnpH "sport = :$port" 2>/dev/null |
-            sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/\1 (pid \2)/p' | head -n 1
-    fi
+    awk -v p="$1" '$1 == p { printf "%s (pid %s)\n", $2, $3; exit }' <<< "$LISTENERS"
 }
 
 # True if something on the laptop accepts connections on 127.0.0.1:$1.
+# DEVHOST_PORT_PROBE names a command to ask instead of connecting (tests).
 port_accepts() {
-    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+    if [[ -n "${DEVHOST_PORT_PROBE:-}" ]]; then
+        "$DEVHOST_PORT_PROBE" "$1"
+    else
+        (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+    fi
 }
 
 # ---------------------------------------------------------- forward state
@@ -290,6 +379,21 @@ forward_spec() {
     echo "127.0.0.1:$port:$addr:$port"
 }
 
+# Forwards live in the master. When a different master answers than the one
+# they were opened on (laptop sleep, VM reboot, network change), they are gone
+# whatever the state file says: forget them so reconcile opens them again.
+forget_forwards_if_master_changed() {
+    local mpid
+    mpid="$(master_pid)"
+    [[ -n "$mpid" ]] || return 0
+    if [[ "$mpid" != "$(cat "$MASTER_PID_FILE" 2>/dev/null)" ]]; then
+        [[ -s "$FORWARDS_FILE" ]] && log "ssh master restarted (pid $mpid); re-adding forwards"
+        : > "$FORWARDS_FILE"
+        : > "$CONFLICTS_FILE"
+        echo "$mpid" > "$MASTER_PID_FILE"
+    fi
+}
+
 # A conflict is remembered once per port+container and forgotten when the
 # container dies, is no longer running, or the port gets forwarded after all.
 record_conflict() {
@@ -313,7 +417,8 @@ clear_conflicts_for_container() {  # ID prefix match, like forward_ports_for
     mv "$CONFLICTS_FILE.tmp" "$CONFLICTS_FILE"
 }
 
-# Mirrors 127.0.0.1:PORT on the laptop to ADDR:PORT on the VM.
+# Mirrors 127.0.0.1:PORT on the laptop to ADDR:PORT on the VM. Expects a
+# listener snapshot (snapshot_listeners) to have been taken.
 add_forward() {
     local port="$1" addr="$2" cid="$3" name="$4" holder mpid
     if forward_exists "$port"; then
@@ -368,10 +473,11 @@ cancel_all_forwards() {
 
 add_container_forwards() {
     local cid="$1" name="$2" port addr
+    [[ $LISTENERS_FRESH -eq 1 ]] || snapshot_listeners
     while read -r port addr; do
         [[ -n "$port" ]] || continue
         add_forward "$port" "$addr" "$cid" "$name" || true
-    done < <(docker --context "$CONTEXT" port "$cid" 2>/dev/null | parse_published_ports)
+    done < <(with_deadline 15 remote_docker port "$cid" 2>/dev/null | parse_published_ports)
 }
 
 cancel_container_forwards() {
@@ -387,10 +493,11 @@ cancel_container_forwards() {
 # --no-trunc: full IDs, so they compare equal to the IDs in `docker events`.
 reconcile() {
     local running known cid name port _addr _rest
-    running="$(docker --context "$CONTEXT" ps --no-trunc --format '{{.ID}} {{.Names}}')" || {
-        log "cannot list containers on context '$CONTEXT'"
+    running="$(with_deadline 30 remote_docker ps --no-trunc --format '{{.ID}} {{.Names}}')" || {
+        log "cannot list containers on $TARGET"
         return 1
     }
+    forget_forwards_if_master_changed
     known="$(cat "$FORWARDS_FILE" 2>/dev/null || true)"
     while read -r port _addr cid name; do
         [[ -n "$port" ]] || continue
@@ -405,10 +512,13 @@ reconcile() {
             clear_conflicts_for_container "$cid"
         fi
     done <<< "$known"
+    snapshot_listeners
+    LISTENERS_FRESH=1
     while read -r cid name; do
         [[ -n "$cid" ]] || continue
         add_container_forwards "$cid" "$name"
     done <<< "$running"
+    LISTENERS_FRESH=0
 }
 
 handle_event() {
@@ -421,11 +531,13 @@ handle_event() {
 
 # Follows container start/die events from unix time $1 on. Events since the
 # last reconcile are replayed, so nothing that started while the stream was
-# being (re)attached is missed; handlers are idempotent.
+# being (re)attached is missed; handlers are idempotent. The stream runs over
+# the control master, so it dies with the master and is covered by its
+# keepalives (the remote `docker events` lingers until its next write).
 follow_events() {
-    docker --context "$CONTEXT" events --since "$1" \
+    remote_docker events --since "$1" \
         --filter type=container --filter event=start --filter event=die \
-        --format '{{.Action}} {{.ID}} {{.Actor.Attributes.name}}' |
+        --format '{{.Action}} {{.Actor.ID}} {{.Actor.Attributes.name}}' |
         while read -r action cid name; do
             forwarder_wanted || exit 0
             handle_event "$action" "$cid" "$name"
@@ -436,7 +548,7 @@ follow_events() {
 forwarder_cleanup() {
     kill_descendants $$
     cancel_all_forwards
-    rm -f "$FWD_READY_FILE"
+    rm -f "$FWD_READY_FILE" "$FWD_STREAM_FILE"
 }
 
 # True while the pid file still names this forwarder; `down` removes it.
@@ -448,7 +560,8 @@ reconcile_generation() { cat "$FWD_GEN_FILE" 2>/dev/null || echo 0; }
 bump_reconcile_generation() { echo "$(( $(reconcile_generation) + 1 ))" > "$FWD_GEN_FILE"; }
 
 # Asks a running forwarder to reconcile now (SIGUSR1) and waits for it to
-# finish, so a conflict whose local port has been freed is retried.
+# finish, so a conflict whose local port has been freed is retried and
+# forwards lost with a dead master are re-added.
 request_reconcile() {
     local pid gen ticks=0
     pid="$(forwarder_pid)"
@@ -456,19 +569,41 @@ request_reconcile() {
     gen="$(reconcile_generation)"
     kill -USR1 "$pid" 2>/dev/null || return 1
     while [[ "$(reconcile_generation)" == "$gen" ]]; do
-        [[ $ticks -lt 100 ]] || return 1
+        [[ $ticks -lt 200 ]] || return 1
         sleep 0.1
         ticks=$((ticks + 1))
     done
+}
+
+# The event stream runs in a background subshell. It removes a marker file
+# when it ends, because the finished subshell stays a zombie (kill -0 still
+# succeeds) until it is waited for.
+STREAM_PID=""
+
+start_stream() {   # $1: unix time to replay events from
+    touch "$FWD_STREAM_FILE"
+    ( follow_events "$1"; rm -f "$FWD_STREAM_FILE" ) &
+    STREAM_PID=$!
+}
+
+stream_alive() { [[ -e "$FWD_STREAM_FILE" ]]; }
+
+# Stops the event stream: the subshell, its ssh and the remote docker events.
+stop_stream() {
+    kill_tree "$STREAM_PID"
+    wait "$STREAM_PID" 2>/dev/null || true
+    rm -f "$FWD_STREAM_FILE"
 }
 
 RECONCILE_WANTED=0
 
 # Background process started by `up`: reconcile once, then follow events.
 # If the stream ends (VM reboot, SSH drop), keep the forwards, wait with
-# backoff, and reconcile again: stale ones go, new ones come.
+# backoff, and reconcile again: stale ones go, new ones come. Only one process
+# changes the state files at a time: a reconcile request stops the event
+# handler first and restarts it afterwards.
 forwarder_main() {
-    local loop_pid backoff=2 ticks=0 daemon_ok=1 started since
+    local backoff=2 ticks=0 daemon_ok=1 started since checks
     FORWARDER_PID=$$
     trap '' HUP
     trap 'exit 0' TERM INT
@@ -487,18 +622,29 @@ forwarder_main() {
     touch "$FWD_READY_FILE"
     while forwarder_wanted; do
         started="$(date +%s)"
-        follow_events "$since" &
-        loop_pid=$!
-        # wait returns early when a trapped signal (USR1) arrives; keep waiting
-        # while the stream is alive, reconciling when asked.
-        while pid_alive "$loop_pid"; do
-            wait "$loop_pid" 2>/dev/null || true
+        start_stream "$since"
+        checks=0
+        # Polled rather than waited on, so reconcile requests (USR1) and the
+        # master watchdog get a turn every second.
+        while stream_alive; do
             if [[ $RECONCILE_WANTED -eq 1 ]]; then
                 RECONCILE_WANTED=0
+                since="$(date +%s)"
+                stop_stream
                 reconcile || true
                 bump_reconcile_generation
+                start_stream "$since"
+                continue
             fi
+            checks=$((checks + 1))
+            if [[ $((checks % 5)) -eq 0 ]] && ! master_running; then
+                log "ssh master is gone"
+                stop_stream
+                break
+            fi
+            sleep 1
         done
+        wait "$STREAM_PID" 2>/dev/null || true
         forwarder_wanted || break
         # A stream that stayed up a while earns a fresh backoff; a stream that
         # ends immediately (daemon flapping) backs off further each time.
@@ -510,7 +656,7 @@ forwarder_main() {
         backoff=$(( backoff < 30 ? backoff * 2 : 30 ))
         forwarder_wanted || break
         since="$(date +%s)"
-        if { master_running || start_master; } && reconcile; then
+        if start_master && reconcile; then
             bump_reconcile_generation
             if [[ $daemon_ok -eq 0 ]]; then
                 notify "daemon is back; mirroring ports again"
@@ -536,7 +682,7 @@ start_forwarder() {
     fi
     # Forwards a dead forwarder left in the master would look like conflicts.
     cancel_all_forwards
-    rm -f "$FWD_PID_FILE" "$FWD_READY_FILE" "$FWD_GEN_FILE" "$FORWARDS_FILE" "$CONFLICTS_FILE"
+    rm -f "$FWD_PID_FILE" "$FWD_READY_FILE" "$FWD_STREAM_FILE" "$FWD_GEN_FILE" "$FORWARDS_FILE" "$CONFLICTS_FILE" "$MASTER_PID_FILE"
     : > "$FORWARDS_FILE"
     : > "$CONFLICTS_FILE"
     # Job control (-m) puts the forwarder in its own process group, so `down`
@@ -582,16 +728,25 @@ stop_forwarder() {
     done
 }
 
-# Prints the conflicts in file $1 (default: the live file); returns 1 if any.
+# Prints the conflicts in file $1 (default: the live file) under headline $2;
+# returns 1 if there are any.
 report_conflicts() {
-    local file="${1:-$CONFLICTS_FILE}" port cid name reason
+    local file="${1:-$CONFLICTS_FILE}" headline="${2:-some published ports were NOT mirrored onto this laptop:}"
+    local port cid name reason
     [[ -s "$file" ]] || return 0
-    log "some published ports were NOT mirrored onto this laptop:"
+    log "$headline"
     while IFS='|' read -r port cid name reason; do
         printf '  127.0.0.1:%s  container %s (%s): %s\n' "$port" "$name" "${cid:0:12}" "$reason" >&2
     done < "$file"
     log "free the port (or stop the container) and retry; forwards never move to another port."
     return 1
+}
+
+check_conflict_mode() {
+    case "$CONFLICT_MODE" in
+        auto|fail|warn) ;;
+        *) die "DEVHOST_CONFLICTS must be auto, fail or warn (got '$CONFLICT_MODE')" ;;
+    esac
 }
 
 # ------------------------------------------------------------------- sync
@@ -618,16 +773,23 @@ mutagen_available() { command -v mutagen >/dev/null 2>&1; }
 
 sync_exists() { mutagen sync list "$(sync_name)" >/dev/null 2>&1; }
 
+# The allow-path.sh invocation that would make $PWD syncable: the laptop home
+# when the checkout is under it, otherwise the checkout itself.
+allow_path_hint() {
+    local prefix="$PWD"
+    if [[ "$PWD" == "$HOME" || "$PWD" == "$HOME"/* ]]; then
+        prefix="$HOME"
+    fi
+    echo "sudo ./guest/allow-path.sh $(ssh_user) $(printf '%q' "$prefix")"
+}
+
 # The same absolute path must exist on the VM and be writable by this user.
 ensure_remote_dir() {
-    local quoted prefix
+    local quoted
     quoted="$(printf '%q' "$PWD")"
     if ! mux_ssh -n "$TARGET" "mkdir -p $quoted && [ -w $quoted ] && [ -O $quoted ]" 2>/dev/null; then
-        # The prefix to create on the VM is the laptop home when the checkout is under it.
-        prefix="$(dirname "$PWD")"
-        [[ "$PWD" == "$HOME"/* ]] && prefix="$HOME"
         log "$PWD does not exist on $TARGET, or is not owned by you."
-        log "On the VM, run:  sudo ./guest/allow-path.sh ${TARGET%%@*} $(printf '%q' "$prefix")"
+        log "On the VM, run:  $(allow_path_hint)"
         log "sync not possible until the path exists on the VM and is owned by you"
         return 1
     fi
@@ -651,9 +813,9 @@ start_sync() {
     done < <(sync_ignore_patterns)
     log "syncing $PWD -> $TARGET:$PWD"
     # ${arr[@]+...}: bash 3.2 treats an empty array as unbound under set -u.
-    mutagen sync create --name "$name" --label devhost=1 --sync-mode two-way-resolved \
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync create --name "$name" --label devhost=1 --sync-mode two-way-resolved \
         ${ignore_args[@]+"${ignore_args[@]}"} "$PWD" "$(sync_beta_url)" >/dev/null || {
-        log "mutagen sync create failed"
+        log "mutagen sync create failed or timed out"
         return 1
     }
 }
@@ -718,13 +880,17 @@ other_runs_alive() {
     return $alive
 }
 
+STALE_MODE=""   # mode of the session session_active last found stale
+
 # A session file is only trusted while the processes behind it are alive;
-# a crash or kill -9 leaves the file behind.
+# a crash or kill -9 leaves the file behind. A stale session is restarted in
+# the mode it had: a directory brought `up` stays up.
 session_active() {
     session_registered || return 1
     if forwarder_running && master_running && { ! sync_enabled || sync_exists; }; then
         return 0
     fi
+    STALE_MODE="$(session_mode)"
     if sync_enabled && ! mutagen_available; then
         log "stale session for $PWD (mutagen is not installed); restarting it"
     else
@@ -764,17 +930,30 @@ runs_alive_in() {
     return 1
 }
 
+# Undoes a session that never got registered (startup failed or was
+# interrupted): nothing may be left running for it. Caller holds the lock.
+abandon_session() {
+    stop_sync
+    prune_sessions
+    sessions_remaining || { stop_forwarder; stop_master; }
+}
+
 # Starts everything for $PWD in mode $1 (up|run). Caller holds the lock.
+# Returns 1 (after cleaning up) when it can't.
 session_start() {
     local mode="$1"
-    daemon_reachable ||
-        die "cannot reach the daemon on context '$CONTEXT' (try: devhost probe)"
-    start_master || exit 1
+    daemon_reachable || {
+        log "cannot reach the daemon on context '$CONTEXT' (try: devhost probe)"
+        return 1
+    }
+    start_master || return 1
+    if [[ $MASTER_STARTED -eq 1 ]] && forwarder_running; then
+        # Its forwards died with the old master; it re-adds them on reconcile.
+        request_reconcile || true
+    fi
     if ! start_forwarder || ! start_sync; then
-        # Don't leave a master and forwarder behind for a session that never started.
-        prune_sessions
-        sessions_remaining || { stop_forwarder; stop_master; }
-        exit 1
+        abandon_session
+        return 1
     fi
     register_session "$mode"
     log "up: forwarding published ports to 127.0.0.1; $(sync_enabled && echo "syncing $PWD" || echo "sync disabled")"
@@ -801,9 +980,10 @@ session_stop() {
 cmd_probe() {
     local rc=0
     resolve_target
-    # ControlPath=none: never reuse a shared master, whose liveness we can't bound.
+    # ControlPath=none: never reuse a shared master, whose liveness we can't
+    # bound. ConnectTimeout plus the deadline stay under the 5s promised.
     # shellcheck disable=SC2046
-    with_deadline 5 ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=3 -o ControlPath=none \
+    with_deadline 4 ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=3 -o ControlPath=none \
         "$TARGET" docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || rc=$?
     if [[ $rc -eq 0 ]]; then
         echo "devhost ($TARGET) is up"
@@ -813,10 +993,23 @@ cmd_probe() {
     return 1
 }
 
+UP_STARTING=0
+
+up_cleanup() {
+    if [[ $UP_STARTING -eq 1 ]]; then
+        trap '' INT TERM HUP
+        abandon_session
+    fi
+    lock_release
+}
+
 cmd_up() {
     init_state
     resolve_target
-    trap 'lock_release' EXIT
+    trap 'up_cleanup' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     lock_acquire
     if session_active; then
         if [[ "$(session_mode)" == run ]]; then
@@ -824,7 +1017,9 @@ cmd_up() {
         fi
         log "$PWD is already up"
     else
-        session_start up
+        UP_STARTING=1
+        session_start up || exit 1
+        UP_STARTING=0
     fi
     lock_release
 }
@@ -842,17 +1037,22 @@ cmd_down() {
     log "down"
 }
 
-# Recorded conflicts block run/flush. Before deciding, give the forwarder a
-# chance to retry them: the local port may have been freed meanwhile.
-# Returns 1 (after reporting) if conflicts remain.
+# Recorded conflicts fail `flush` (unless DEVHOST_CONFLICTS=warn). Before
+# deciding, give the forwarder a chance to retry them: the local port may
+# have been freed meanwhile. Returns 1 (after reporting) if conflicts remain.
 check_conflicts() {
     [[ -s "$CONFLICTS_FILE" ]] || return 0
     request_reconcile || true
     [[ -s "$CONFLICTS_FILE" ]] || return 0
+    if [[ "$CONFLICT_MODE" == warn ]]; then
+        report_conflicts "" "warning: some published ports are NOT mirrored onto this laptop:" || true
+        return 0
+    fi
     report_conflicts
 }
 
 cmd_flush() {
+    check_conflict_mode
     init_state
     resolve_target
     session_registered || die "$PWD is not up (run: devhost up)"
@@ -861,13 +1061,89 @@ cmd_flush() {
     check_conflicts
 }
 
+# Conflicts recorded before the command runs belong to containers that were
+# already running (often other developers' on the shared daemon). They are
+# reported; whether they stop the run depends on DEVHOST_CONFLICTS. The
+# forwarder retries them first: the local port may have been freed meanwhile.
+# Saves the ones that remain to $1, so the run can tell new ones apart.
+precheck_conflicts() {
+    local pre="$1"
+    : > "$pre"
+    [[ -s "$CONFLICTS_FILE" ]] || return 0
+    request_reconcile || true
+    cp -f "$CONFLICTS_FILE" "$pre" 2>/dev/null || true
+    [[ -s "$pre" ]] || return 0
+    if [[ "$CONFLICT_MODE" == fail ]]; then
+        report_conflicts "$pre" || true
+        return 1
+    fi
+    report_conflicts "$pre" "warning: ports of containers that were already running are NOT mirrored onto this laptop:" || true
+    log "continuing (DEVHOST_CONFLICTS=$CONFLICT_MODE); set DEVHOST_CONFLICTS=fail to refuse instead"
+}
+
+# After the command: $1 holds the conflicts known before it, $2 the ones
+# recorded by the time it finished. Returns 1 if, under DEVHOST_CONFLICTS,
+# the run must fail because of them.
+run_conflicts_ok() {
+    local pre="$1" post="$2" new="$2.new" port cid rest rc=0
+    [[ -s "$post" ]] || return 0
+    case "$CONFLICT_MODE" in
+        warn)
+            report_conflicts "$post" "warning: some published ports were NOT mirrored onto this laptop:" || true
+            ;;
+        fail)
+            report_conflicts "$post" || rc=1
+            ;;
+        auto)
+            : > "$new"
+            while IFS='|' read -r port cid rest; do
+                [[ -n "$port" ]] || continue
+                grep -q "^$port|$cid|" "$pre" || echo "$port|$cid|$rest" >> "$new"
+            done < "$post"
+            if [[ -s "$new" ]]; then
+                report_conflicts "$new" "ports published while the command ran were NOT mirrored onto this laptop:" || rc=1
+            fi
+            ;;
+    esac
+    rm -f "$new"
+    return $rc
+}
+
 RUN_MODE=""
 RUN_DONE=0
+RUN_STARTING=0      # inside session_start: nothing is registered yet
+RUN_CHILD=""        # pid of the command while it runs
+RUN_INTERRUPTED=0
+RUN_TERM_SENT=0
+
+# Signals while the command runs. A terminal's Ctrl-C has already reached
+# the command (same process group), so INT is only noted, never forwarded: a
+# second INT would make e.g. `docker compose up` force-kill instead of
+# stopping cleanly. TERM and HUP (timeout, CI cancel, closed terminal) are
+# passed on to the command once. Before the command starts, any of them
+# aborts the startup; the EXIT trap cleans up.
+on_run_signal() {
+    local sig="$1" code="$2"
+    RUN_INTERRUPTED=1
+    [[ -n "$RUN_CHILD" ]] || exit "$code"
+    if [[ "$sig" != INT && $RUN_TERM_SENT -eq 0 ]]; then
+        RUN_TERM_SENT=1
+        kill -s "$sig" "$RUN_CHILD" 2>/dev/null || true
+    fi
+}
+
 run_cleanup() {
     local teardown=0
     [[ $RUN_DONE -eq 0 ]] || return 0
     RUN_DONE=1
+    trap '' INT TERM HUP      # teardown finishes even if Ctrl-C is pressed again
     lock_acquire
+    if [[ $RUN_STARTING -eq 1 ]]; then
+        # Interrupted while the session was being set up: undo what started.
+        abandon_session
+        lock_release
+        return 0
+    fi
     unregister_run
     if [[ "$RUN_MODE" == run && "$(session_mode)" == run ]] && ! other_runs_alive; then
         teardown=1     # last run out of a run-started session tears it down
@@ -882,40 +1158,55 @@ run_cleanup() {
 }
 
 cmd_run() {
-    local rc=0 snapshot
+    local rc=0 mode snapshot pre
     [[ "${1:-}" == "--" ]] && shift
     [[ $# -gt 0 ]] || die "usage: devhost run [--] <command...>"
+    check_conflict_mode
     init_state
     resolve_target
     trap 'run_cleanup' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    trap 'on_run_signal INT 130' INT
+    trap 'on_run_signal TERM 143' TERM
+    trap 'on_run_signal HUP 129' HUP
     lock_acquire
     if session_active; then
         RUN_MODE="$(session_mode)"
     else
-        session_start run
-        RUN_MODE=run
+        mode="${STALE_MODE:-run}"     # a stale `up` session comes back as `up`
+        RUN_STARTING=1
+        session_start "$mode" || exit 1
+        RUN_STARTING=0
+        RUN_MODE="$mode"
     fi
     register_run
     lock_release
-    # Conflicts found before the command even ran: refuse rather than let the
-    # project talk to whatever holds the port on this laptop.
-    check_conflicts || exit 1
+    pre="$STATE_DIR/conflicts.pre.$$"
+    precheck_conflicts "$pre" || exit 1
     flush_sync
-    set +e
-    DOCKER_CONTEXT="$CONTEXT" "$@"
-    rc=$?
-    set -e
+    # Run the command as a background job and wait for it, so signals reach
+    # this shell while it runs (a foreground child would hold them until it
+    # exits); <&0 keeps the command's stdin, which `&` would otherwise drop.
+    DOCKER_CONTEXT="$CONTEXT" "$@" <&0 &
+    RUN_CHILD=$!
+    while :; do
+        RUN_INTERRUPTED=0
+        rc=0
+        wait "$RUN_CHILD" 2>/dev/null || rc=$?
+        if [[ $RUN_INTERRUPTED -eq 0 ]] || ! pid_alive "$RUN_CHILD"; then
+            break      # the command is done; an interrupted wait tries again
+        fi
+    done
+    RUN_CHILD=""
     # Keep the conflicts recorded meanwhile: teardown deletes the live file.
     snapshot="$STATE_DIR/conflicts.run.$$"
     cp -f "$CONFLICTS_FILE" "$snapshot" 2>/dev/null || : > "$snapshot"
-    # Flushes outputs back (also when the command failed), then tears down.
+    # Flushes outputs back (also when the command failed); the last run of a
+    # run-started session also tears it down.
     run_cleanup
-    if ! report_conflicts "$snapshot" && [[ $rc -eq 0 ]]; then
+    if ! run_conflicts_ok "$pre" "$snapshot" && [[ $rc -eq 0 ]]; then
         rc=1
     fi
-    rm -f "$snapshot"
+    rm -f "$snapshot" "$pre"
     exit "$rc"
 }
 

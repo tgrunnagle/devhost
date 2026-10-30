@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Fake mutagen for tests. State in $FAKE_DIR:
-#   mutagen-sessions   names of existing sessions, one per line
-#   mutagen-status     text printed by `sync list <name>` (e.g. a permission problem)
-#   mutagen-flush-hang if present, `sync flush` blocks for 30s (VM gone away)
+#   mutagen-sessions     names of existing sessions, one per line
+#   mutagen-status       text printed by `sync list <name>` (e.g. a permission problem)
+#   mutagen-flush-hang   if present, `sync flush` blocks for 30s (VM gone away)
+#   mutagen-create-hang  if present, `sync create` blocks for 30s before creating
 # Every invocation is appended to $FAKE_DIR/mutagen.log.
 set -u
 echo "mutagen $*" >> "$FAKE_DIR/mutagen.log"
@@ -22,6 +23,9 @@ case "$sub" in
                 *) shift ;;
             esac
         done
+        if [[ -f "$FAKE_DIR/mutagen-create-hang" ]]; then
+            sleep 30
+        fi
         echo "$name" >> "$sessions"
         echo "Created session $name"
         ;;

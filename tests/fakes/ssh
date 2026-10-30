@@ -1,39 +1,47 @@
 #!/usr/bin/env bash
 # Fake ssh for tests. State lives in $FAKE_DIR:
-#   master            exists while a control master is "running"
+#   master            holds the pid of the "running" control master
 #   ssh-down          if present, connections fail after 1s like a saved VM
 #   ssh-fail-ports    host ports for which `-O forward` fails (one per line)
 #   ssh-remote-fail   if present, remote commands containing this text exit 1
 #   open-forwards     -L specs currently open in the master (maintained here);
 #                     like OpenSSH, `-O cancel` fails unless the exact spec is open
-# `-O check` reports the master as pid 4242.
+# Like OpenSSH, every -O operation fails while no master is running. A remote
+# command that starts with `docker` runs the fake docker on PATH, re-split the
+# way a remote shell would; any other remote command succeeds doing nothing.
 # Every invocation is appended to $FAKE_DIR/ssh.log.
 set -u
 echo "ssh $*" >> "$FAKE_DIR/ssh.log"
 
-mode="" ctl="" fwd="" master_flag=0
+ctl="" fwd="" master_flag=0 dump_config=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -O) ctl="$2"; shift 2 ;;
         -L) fwd="$2"; shift 2 ;;
         -M) master_flag=1; shift ;;
+        -G) dump_config=1; shift ;;
         -o|-S|-p) shift 2 ;;
-        -N|-f) shift ;;
         -*) shift ;;
         *) break ;;
     esac
 done
-mode="$ctl"
+target="${1:-}"
 
-if [[ -n "$mode" ]]; then
-    case "$mode" in
+if [[ $dump_config -eq 1 ]]; then
+    if [[ "$target" == *@* ]]; then echo "user ${target%%@*}"; else echo "user alice"; fi
+    echo "hostname ${target##*@}"
+    exit 0
+fi
+
+if [[ -n "$ctl" ]]; then
+    if [[ ! -f "$FAKE_DIR/master" ]]; then
+        echo "Control socket connect($FAKE_DIR/ssh.sock): No such file or directory" >&2
+        exit 255
+    fi
+    case "$ctl" in
         check)
-            if [[ -f "$FAKE_DIR/master" ]]; then
-                echo "Master running (pid=4242)" >&2
-                exit 0
-            fi
-            echo "Control socket connect: No such file or directory" >&2
-            exit 255
+            echo "Master running (pid=$(cat "$FAKE_DIR/master"))" >&2
+            exit 0
             ;;
         exit)
             rm -f "$FAKE_DIR/master" "$FAKE_DIR/open-forwards"
@@ -59,6 +67,7 @@ if [[ -n "$mode" ]]; then
             exit 255
             ;;
     esac
+    exit 0
 fi
 
 if [[ -f "$FAKE_DIR/ssh-down" ]]; then
@@ -68,17 +77,21 @@ if [[ -f "$FAKE_DIR/ssh-down" ]]; then
 fi
 
 if [[ $master_flag -eq 1 ]]; then
-    touch "$FAKE_DIR/master"
+    echo "$$" > "$FAKE_DIR/master"
     exit 0
 fi
 
 # Remote command: "$1" is the target, the rest is the command.
-shift
-echo "ssh-remote $*" >> "$FAKE_DIR/ssh.log"
-if [[ -f "$FAKE_DIR/ssh-remote-fail" ]] && [[ "$*" == *"$(cat "$FAKE_DIR/ssh-remote-fail")"* ]]; then
+shift || true
+cmd="$*"
+echo "ssh-remote $cmd" >> "$FAKE_DIR/ssh.log"
+if [[ -f "$FAKE_DIR/ssh-remote-fail" ]] && [[ "$cmd" == *"$(cat "$FAKE_DIR/ssh-remote-fail")"* ]]; then
     exit 1
 fi
-case "$*" in
-    "docker version"*) echo "27.0.0" ;;
+case "$cmd" in
+    docker|docker\ *)
+        eval "set -- $cmd"
+        exec "$@"
+        ;;
 esac
 exit 0
