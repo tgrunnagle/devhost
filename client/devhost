@@ -19,16 +19,18 @@
 #   devhost probe                   exit 0 if the daemon answers within ~3s
 #
 # Environment:
-#   DEVHOST_CONTEXT    Docker context to use (default: devhost)
-#   DEVHOST_SSH        SSH target user@host (default: the context's endpoint)
-#   DEVHOST_STATE_DIR  state directory (default: ~/.devhost)
-#   DEVHOST_NO_SYNC=1  mirror ports only, skip the Mutagen sync
+#   DEVHOST_CONTEXT        Docker context to use (default: devhost)
+#   DEVHOST_SSH            SSH target user@host (default: the context's endpoint)
+#   DEVHOST_STATE_DIR      state directory (default: ~/.devhost)
+#   DEVHOST_NO_SYNC=1      mirror ports only, skip the Mutagen sync
+#   DEVHOST_FLUSH_TIMEOUT  seconds to wait for a sync flush (default: 60)
 #
 # Requires: bash, ssh (OpenSSH), docker CLI, mutagen (unless DEVHOST_NO_SYNC=1).
 # Works with bash 3.2 (macOS). Tested with fake docker/ssh/mutagen in tests/.
 
 CONTEXT="${DEVHOST_CONTEXT:-devhost}"
 STATE_DIR="${DEVHOST_STATE_DIR:-$HOME/.devhost}"
+FLUSH_TIMEOUT="${DEVHOST_FLUSH_TIMEOUT:-60}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 SOCK="$STATE_DIR/ssh.sock"
@@ -49,6 +51,15 @@ SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 log() { printf 'devhost: %s\n' "$*" >&2; }
 die() { log "$@"; exit 1; }
+
+# Also writes to the controlling terminal, so the background forwarder can warn
+# the developer during `up`. Silently does nothing without a terminal.
+notify() {
+    log "$@"
+    if [[ -w /dev/tty ]]; then
+        printf 'devhost: %s\n' "$*" > /dev/tty 2>/dev/null || true
+    fi
+}
 
 init_state() {
     mkdir -p "$STATE_DIR" "$SESSIONS_DIR"
@@ -136,6 +147,11 @@ mux_ssh() {
 
 master_running() { mux_ssh -O check "$TARGET" >/dev/null 2>&1; }
 
+# PID of the control master ("Master running (pid=N)"), or nothing.
+master_pid() {
+    mux_ssh -O check "$TARGET" 2>&1 | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -n 1
+}
+
 start_master() {
     if master_running; then
         return 0
@@ -143,8 +159,10 @@ start_master() {
     rm -f "$SOCK"
     # shellcheck disable=SC2046
     ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=5 -o ControlPersist=yes \
-        -M -N -f -S "$SOCK" "$TARGET" ||
-        die "could not open SSH connection to $TARGET"
+        -M -N -f -S "$SOCK" "$TARGET" || {
+        log "could not open SSH connection to $TARGET"
+        return 1
+    }
 }
 
 stop_master() {
@@ -152,6 +170,10 @@ stop_master() {
         mux_ssh -O exit "$TARGET" >/dev/null 2>&1 || true
     fi
     rm -f "$SOCK"
+}
+
+daemon_reachable() {
+    with_deadline 10 docker --context "$CONTEXT" ps -q >/dev/null 2>&1
 }
 
 # ----------------------------------------------------------- port parsing
@@ -211,18 +233,24 @@ forward_ports_for() {  # prints forwarded ports of container $1 (ID prefix match
 record_conflict() {
     local port="$1" cid="$2" name="$3" reason="$4"
     echo "$port|$cid|$name|$reason" >> "$CONFLICTS_FILE"
-    log "CONFLICT: 127.0.0.1:$port for container $name ($cid) not forwarded: $reason"
+    notify "CONFLICT: 127.0.0.1:$port for container $name (${cid:0:12}) not forwarded: $reason"
 }
 
 # Mirrors 127.0.0.1:PORT on the laptop to 127.0.0.1:PORT on the VM.
 add_forward() {
-    local port="$1" cid="$2" name="$3" holder
+    local port="$1" cid="$2" name="$3" holder mpid
     if forward_exists "$port"; then
         forward_record "$port" "$cid" "$name"
         return 0
     fi
     holder="$(port_holder "$port")"
     if [[ -n "$holder" ]]; then
+        # A listener owned by our own SSH master is a forward we lost track of.
+        mpid="$(master_pid)"
+        if [[ -n "$mpid" && "$holder" == *"(pid $mpid)" ]]; then
+            forward_record "$port" "$cid" "$name"
+            return 0
+        fi
         record_conflict "$port" "$cid" "$name" "port already in use on this laptop by $holder"
         return 1
     fi
@@ -246,6 +274,17 @@ cancel_forward() {
     log "cancel 127.0.0.1:$port"
 }
 
+# Cancels every forward recorded in the state file.
+cancel_all_forwards() {
+    local port _cid _name known
+    known="$(cat "$FORWARDS_FILE" 2>/dev/null || true)"
+    while read -r port _cid _name; do
+        [[ -n "$port" ]] || continue
+        cancel_forward "$port"
+    done <<< "$known"
+    : > "$FORWARDS_FILE"
+}
+
 add_container_forwards() {
     local cid="$1" name="$2" port
     for port in $(docker --context "$CONTEXT" port "$cid" 2>/dev/null | parse_published_ports); do
@@ -261,9 +300,10 @@ cancel_container_forwards() {
 }
 
 # Brings forwards in line with the containers that are running right now.
+# --no-trunc: full IDs, so they compare equal to the IDs in `docker events`.
 reconcile() {
     local running known cid name port
-    running="$(docker --context "$CONTEXT" ps --format '{{.ID}} {{.Names}}')" ||
+    running="$(docker --context "$CONTEXT" ps --no-trunc --format '{{.ID}} {{.Names}}')" ||
         die "cannot list containers on context '$CONTEXT'"
     known="$(cat "$FORWARDS_FILE" 2>/dev/null || true)"
     while read -r port cid name; do
@@ -290,23 +330,62 @@ follow_events() {
     docker --context "$CONTEXT" events --filter type=container --filter event=start --filter event=die \
         --format '{{.Action}} {{.ID}} {{.Actor.Attributes.name}}' |
         while read -r action cid name; do
+            forwarder_wanted || exit 0
             handle_event "$action" "$cid" "$name"
         done
 }
 
+forwarder_exit() {
+    kill_descendants $$
+    cancel_all_forwards
+    rm -f "$FWD_READY_FILE"
+    exit 0
+}
+
+# True while the pid file still names this forwarder; `down` removes it.
+forwarder_wanted() {
+    [[ "$(cat "$FWD_PID_FILE" 2>/dev/null)" == "${FORWARDER_PID:-$$}" ]]
+}
+
 # Background process started by `up`: reconcile once, then follow events.
+# If the stream ends (VM reboot, SSH drop), drop the forwards, wait for the
+# daemon to come back, and start over.
 forwarder_main() {
-    local loop_pid
+    local loop_pid backoff=2 ticks=0
+    FORWARDER_PID=$$
     trap '' HUP
-    trap 'kill_descendants $$; exit 0' TERM INT
+    trap 'forwarder_exit' TERM INT
+    # `up` writes the pid file right after starting us; wait for it briefly.
+    until forwarder_wanted; do
+        [[ $ticks -lt 50 ]] || exit 1
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
     resolve_target
     reconcile
     touch "$FWD_READY_FILE"
-    follow_events &
-    loop_pid=$!
-    wait "$loop_pid" || true
-    log "docker events stream ended; forwarder exiting"
-    rm -f "$FWD_PID_FILE" "$FWD_READY_FILE"
+    while forwarder_wanted; do
+        follow_events &
+        loop_pid=$!
+        wait "$loop_pid" || true
+        forwarder_wanted || break
+        notify "docker events stream ended; dropping forwards until the daemon answers again"
+        cancel_all_forwards
+        sleep 1
+        until daemon_reachable; do
+            forwarder_wanted || break
+            sleep "$backoff"
+            backoff=$(( backoff < 30 ? backoff * 2 : 30 ))
+        done
+        forwarder_wanted || break
+        backoff=2
+        if ! master_running; then
+            start_master || continue
+        fi
+        notify "daemon is back; mirroring ports again"
+        reconcile
+    done
+    forwarder_exit
 }
 
 forwarder_pid() { cat "$FWD_PID_FILE" 2>/dev/null || true; }
@@ -318,11 +397,18 @@ start_forwarder() {
     if forwarder_running; then
         return 0
     fi
+    # Forwards a dead forwarder left in the master would look like conflicts.
+    cancel_all_forwards
     rm -f "$FWD_PID_FILE" "$FWD_READY_FILE" "$FORWARDS_FILE" "$CONFLICTS_FILE"
     : > "$FORWARDS_FILE"
     : > "$CONFLICTS_FILE"
+    # Job control (-m) puts the forwarder in its own process group, so `down`
+    # can signal it and everything it spawns at once, and Ctrl-C in the
+    # developer's terminal doesn't reach it.
+    set -m
     DEVHOST_SSH="$TARGET${SSH_PORT:+:$SSH_PORT}" "$SELF" _forwarder >> "$FWD_LOG" 2>&1 < /dev/null &
     pid=$!
+    set +m
     echo "$pid" > "$FWD_PID_FILE"
     while [[ ! -f "$FWD_READY_FILE" ]]; do
         if ! pid_alive "$pid"; then
@@ -339,22 +425,31 @@ start_forwarder() {
 }
 
 stop_forwarder() {
-    local pid
+    local pid ticks=0
     pid="$(forwarder_pid)"
-    if pid_alive "$pid"; then
-        kill_tree "$pid"
-    fi
-    rm -f "$FWD_PID_FILE" "$FWD_READY_FILE"
+    rm -f "$FWD_PID_FILE" "$FWD_READY_FILE"   # the forwarder also exits when this is gone
+    pid_alive "$pid" || return 0
+    # Its process group (see start_forwarder); fall back to walking the tree.
+    kill -TERM -- "-$pid" 2>/dev/null || kill_tree "$pid"
+    while pid_alive "$pid"; do
+        if [[ $ticks -ge 50 ]]; then
+            log "forwarder (pid $pid) ignored TERM; killing it"
+            kill -KILL -- "-$pid" 2>/dev/null || { kill_descendants "$pid"; kill -9 "$pid" 2>/dev/null || true; }
+            break
+        fi
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
 }
 
-# Prints recorded conflicts in a readable form; returns 1 if there were any.
+# Prints the conflicts in file $1 (default: the live file); returns 1 if any.
 report_conflicts() {
-    local port cid name reason
-    [[ -s "$CONFLICTS_FILE" ]] || return 0
+    local file="${1:-$CONFLICTS_FILE}" port cid name reason
+    [[ -s "$file" ]] || return 0
     log "some published ports were NOT mirrored onto this laptop:"
     while IFS='|' read -r port cid name reason; do
         printf '  127.0.0.1:%s  container %s (%s): %s\n' "$port" "$name" "${cid:0:12}" "$reason" >&2
-    done < "$CONFLICTS_FILE"
+    done < "$file"
     log "free the port (or stop the container) and retry; forwards never move to another port."
     return 1
 }
@@ -381,43 +476,55 @@ sync_beta_url() { echo "$TARGET:${SSH_PORT:+$SSH_PORT:}$PWD"; }
 
 sync_exists() { mutagen sync list "$(sync_name)" >/dev/null 2>&1; }
 
+# The same absolute path must exist on the VM and be writable by this user.
 ensure_remote_dir() {
     local quoted
     quoted="$(printf '%q' "$PWD")"
     # shellcheck disable=SC2046
-    if ! ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=5 "$TARGET" "mkdir -p $quoted" 2>/dev/null; then
-        log "cannot create $PWD on $TARGET."
+    if ! ssh "${SSH_OPTS[@]}" $(ssh_port_opts) -o ConnectTimeout=5 "$TARGET" \
+            "mkdir -p $quoted && [ -w $quoted ] && [ -O $quoted ]" 2>/dev/null; then
+        log "$PWD does not exist on $TARGET, or is not owned by you."
         log "On the VM, run:  sudo ./guest/allow-path.sh ${TARGET%%@*} $(printf '%q' "$(dirname "$PWD")")"
-        die "sync not possible until the path exists on the VM and is owned by you"
+        log "sync not possible until the path exists on the VM and is owned by you"
+        return 1
     fi
 }
 
+# Returns 1 (after logging) when the sync can't be set up.
 start_sync() {
     local name pattern ignore_args=()
     sync_enabled || return 0
-    command -v mutagen >/dev/null 2>&1 ||
-        die "mutagen not found. Install it (https://mutagen.io) or set DEVHOST_NO_SYNC=1 for ports only."
+    if ! command -v mutagen >/dev/null 2>&1; then
+        log "mutagen not found. Install it (https://mutagen.io) or set DEVHOST_NO_SYNC=1 for ports only."
+        return 1
+    fi
     name="$(sync_name)"
     if sync_exists; then
         return 0
     fi
-    ensure_remote_dir
+    ensure_remote_dir || return 1
     while read -r pattern; do
         ignore_args+=(--ignore "$pattern")
     done < <(sync_ignore_patterns)
     log "syncing $PWD -> $TARGET:$PWD"
+    # ${arr[@]+...}: bash 3.2 treats an empty array as unbound under set -u.
     mutagen sync create --name "$name" --label devhost=1 --sync-mode two-way-resolved \
-        "${ignore_args[@]}" "$PWD" "$(sync_beta_url)" >/dev/null ||
-        die "mutagen sync create failed"
+        ${ignore_args[@]+"${ignore_args[@]}"} "$PWD" "$(sync_beta_url)" >/dev/null || {
+        log "mutagen sync create failed"
+        return 1
+    }
 }
 
 # Waits for the sync to settle; warns about files Mutagen cannot update.
 flush_sync() {
-    local name status
+    local name status rc=0
     sync_enabled || return 0
     name="$(sync_name)"
     sync_exists || return 0
-    if ! mutagen sync flush "$name" >/dev/null 2>&1; then
+    with_deadline "$FLUSH_TIMEOUT" mutagen sync flush "$name" >/dev/null 2>&1 || rc=$?
+    if [[ $rc -eq 124 ]]; then
+        log "warning: sync flush did not finish within ${FLUSH_TIMEOUT}s; outputs may be stale"
+    elif [[ $rc -ne 0 ]]; then
         log "warning: mutagen sync flush failed; outputs may be stale (devhost status for details)"
     fi
     status="$(mutagen sync list "$name" 2>/dev/null || true)"
@@ -430,7 +537,8 @@ flush_sync() {
 stop_sync() {
     sync_enabled || return 0
     if sync_exists; then
-        mutagen sync terminate "$(sync_name)" >/dev/null 2>&1 || log "warning: mutagen sync terminate failed"
+        with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate "$(sync_name)" >/dev/null 2>&1 ||
+            log "warning: mutagen sync terminate failed or timed out"
     fi
 }
 
@@ -441,6 +549,18 @@ session_registered() { [[ -f "$SESSIONS_DIR/$(session_id)" ]]; }
 register_session() { echo "$PWD" > "$SESSIONS_DIR/$(session_id)"; }
 unregister_session() { rm -f "$SESSIONS_DIR/$(session_id)"; }
 sessions_remaining() { [[ -n "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]]; }
+
+# A session file is only trusted while the processes behind it are alive;
+# a crash or kill -9 leaves the file behind.
+session_active() {
+    session_registered || return 1
+    if forwarder_running && master_running && { ! sync_enabled || sync_exists; }; then
+        return 0
+    fi
+    log "stale session for $PWD (processes gone); restarting it"
+    unregister_session
+    return 1
+}
 
 # --------------------------------------------------------------- commands
 
@@ -462,17 +582,22 @@ cmd_probe() {
 cmd_up() {
     init_state
     resolve_target
-    if session_registered; then
+    if session_active; then
         log "$PWD is already up"
         return 0
     fi
-    docker --context "$CONTEXT" ps -q >/dev/null 2>&1 ||
+    daemon_reachable ||
         die "cannot reach the daemon on context '$CONTEXT' (try: devhost probe)"
-    start_master
+    start_master || exit 1
     start_forwarder
-    start_sync
+    if ! start_sync; then
+        # Don't leave a master and forwarder behind for a session that never started.
+        sessions_remaining || { stop_forwarder; stop_master; }
+        exit 1
+    fi
     register_session
     log "up: forwarding published ports to 127.0.0.1; $(sync_enabled && echo "syncing $PWD" || echo "sync disabled")"
+    log "conflicts found later are printed to this terminal and by 'devhost status'/'devhost flush'; log: $FWD_LOG"
     report_conflicts || true
 }
 
@@ -498,6 +623,7 @@ cmd_flush() {
     session_registered || die "$PWD is not up (run: devhost up)"
     flush_sync
     log "flushed"
+    report_conflicts
 }
 
 RUN_NESTED=0
@@ -513,7 +639,7 @@ run_cleanup() {
 }
 
 cmd_run() {
-    local rc=0
+    local rc=0 snapshot
     [[ "${1:-}" == "--" ]] && shift
     [[ $# -gt 0 ]] || die "usage: devhost run [--] <command...>"
     init_state
@@ -521,33 +647,41 @@ cmd_run() {
     trap 'run_cleanup' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    if session_registered; then
+    if session_active; then
         RUN_NESTED=1
     else
         cmd_up
-        # Conflicts found before the command even ran: refuse rather than let the
-        # project talk to whatever holds the port on this laptop.
-        [[ -s "$CONFLICTS_FILE" ]] && exit 1
     fi
+    # Conflicts found before the command even ran: refuse rather than let the
+    # project talk to whatever holds the port on this laptop.
+    [[ -s "$CONFLICTS_FILE" ]] && exit 1
     flush_sync
     set +e
     DOCKER_CONTEXT="$CONTEXT" "$@"
     rc=$?
     set -e
+    # Keep the conflicts recorded meanwhile: teardown deletes the live file.
+    snapshot="$STATE_DIR/conflicts.run.$$"
+    cp -f "$CONFLICTS_FILE" "$snapshot" 2>/dev/null || : > "$snapshot"
     # Flushes outputs back (also when the command failed), then tears down.
     run_cleanup
-    if [[ $RUN_NESTED -eq 0 ]]; then
-        if ! report_conflicts && [[ $rc -eq 0 ]]; then
-            rc=1
-        fi
+    if ! report_conflicts "$snapshot" && [[ $rc -eq 0 ]]; then
+        rc=1
     fi
+    rm -f "$snapshot"
     exit "$rc"
 }
 
 cmd_status() {
-    local port cid name dir
+    local port cid name reason dir
     init_state
     resolve_target
+    if [[ -s "$CONFLICTS_FILE" ]]; then
+        echo "CONFLICTS (ports NOT mirrored):"
+        while IFS='|' read -r port cid name reason; do
+            echo "  127.0.0.1:$port -> $name (${cid:0:12}): $reason"
+        done < "$CONFLICTS_FILE"
+    fi
     echo "context:    $CONTEXT ($TARGET${SSH_PORT:+ port $SSH_PORT})"
     if cmd_probe >/dev/null 2>&1; then
         echo "daemon:     reachable"
@@ -560,7 +694,7 @@ cmd_status() {
         echo "ssh master: not running"
     fi
     if forwarder_running; then
-        echo "forwarder:  running (pid $(forwarder_pid))"
+        echo "forwarder:  running (pid $(forwarder_pid), log $FWD_LOG)"
     else
         echo "forwarder:  not running"
     fi
@@ -572,12 +706,6 @@ cmd_status() {
         done < "$FORWARDS_FILE"
     else
         echo "forwards:   none"
-    fi
-    if [[ -s "$CONFLICTS_FILE" ]]; then
-        echo "conflicts:"
-        while IFS='|' read -r port cid name _; do
-            echo "  127.0.0.1:$port -> $name (${cid:0:12}) NOT forwarded"
-        done < "$CONFLICTS_FILE"
     fi
     if sessions_remaining; then
         echo "up in:"

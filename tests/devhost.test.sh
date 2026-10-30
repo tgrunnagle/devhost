@@ -32,7 +32,16 @@ setup() {
     cd "$PROJECT" || exit 1
 }
 
+# Kills a forwarder a failed test left behind (its whole process group).
+kill_leftover_forwarder() {
+    local pid
+    pid="$(cat "$DEVHOST_STATE_DIR/forwarder.pid" 2>/dev/null)" || return 0
+    [[ -n "$pid" ]] || return 0
+    kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+}
+
 teardown() {
+    kill_leftover_forwarder
     cd "$ROOT" || exit 1
     rm -rf "$TMP"
 }
@@ -115,7 +124,9 @@ test_follow_events_pipeline() {
     echo "80/tcp -> 127.0.0.1:48081" > "$FAKE_DIR/port.aaaa00000001"
     printf 'start aaaa00000001 nginx\ndie aaaa00000001 nginx\n' > "$FAKE_DIR/events"
     echo 0 > "$FAKE_DIR/events-hold"
+    echo $$ > "$FWD_PID_FILE"      # the loop stops once the pid file no longer names it
     follow_events 2>/dev/null
+    rm -f "$FWD_PID_FILE"          # $$ is the harness; don't let teardown kill it
     assert_file_has "$FAKE_DIR/docker.log" "events --filter type=container --filter event=start --filter event=die" "events filters"
     assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:48081:127.0.0.1:48081" "forward from event"
     assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:48081:127.0.0.1:48081" "cancel from event"
@@ -189,10 +200,11 @@ test_run_passes_exit_code_and_sets_context() {
     echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
     local rc=0
     # shellcheck disable=SC2016  # expanded by the child shell on purpose
-    run_devhost run -- sh -c 'echo "$DOCKER_CONTEXT" > ctx; exit 3' 2>/dev/null || rc=$?
+    run_devhost run -- sh -c 'echo "$DOCKER_CONTEXT" > ctx; exit 3' 2>"$TMP/stderr" || rc=$?
     assert_eq "$rc" "3" "child exit code passed through"
     assert_eq "$(cat ctx)" "devhost" "DOCKER_CONTEXT set for the child"
     assert_eq "$(grep -c 'sync flush' "$FAKE_DIR/mutagen.log")" "2" "flushed before and after, even on failure"
+    assert_file_lacks "$TMP/stderr" "warning:" "no warnings on the happy path"
     assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate" "sync removed"
     assert_file_has "$FAKE_DIR/ssh.log" "-M -N -f -S $DEVHOST_STATE_DIR/ssh.sock alice@devhost" "master opened"
     assert_file_has "$FAKE_DIR/ssh.log" "-O forward -L 127.0.0.1:6379:127.0.0.1:6379" "existing container forwarded before the command"
@@ -207,27 +219,139 @@ test_run_passes_exit_code_and_sets_context() {
 }
 
 test_run_fails_on_startup_conflict() {
-    echo "6379 redis-server 4242" > "$FAKE_DIR/busy-ports"
+    echo "6379 redis-server 9999" > "$FAKE_DIR/busy-ports"
     printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
     echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
     local out rc=0
     out="$(run_devhost run -- sh -c 'echo ran > ran' 2>&1)" || rc=$?
     assert_eq "$rc" "1" "run exits 1 on conflict"
     assert_missing ran "command not run"
-    [[ "$out" == *"6379"*"redis"*"redis-server (pid 4242)"* ]] || fail "conflict reported: $out"
+    [[ "$out" == *"6379"*"redis"*"redis-server (pid 9999)"* ]] || fail "conflict reported: $out"
     assert_file_lacks "$FAKE_DIR/ssh.log" "-O forward" "no forward to another port"
     assert_missing "$FAKE_DIR/master" "cleaned up"
 }
 
 test_run_fails_on_conflict_during_command() {
     : > "$FAKE_DIR/ps"
-    echo "6380 redis-server 4242" > "$FAKE_DIR/busy-ports"
+    echo "6380 redis-server 9999" > "$FAKE_DIR/busy-ports"
     echo "6379/tcp -> 127.0.0.1:6380" > "$FAKE_DIR/port.dddd00000001"
     printf 'start dddd00000001 redis\n' > "$FAKE_DIR/events"
+    # The container starts 1s into a 3s command, after the pre-command check.
+    echo 1 > "$FAKE_DIR/events-delay"
     local out rc=0
-    out="$(run_devhost run -- sleep 1 2>&1)" || rc=$?
+    out="$(run_devhost run -- sleep 3 2>&1)" || rc=$?
     assert_eq "$rc" "1" "successful command still exits 1 when a port could not be mirrored"
-    [[ "$out" == *"6380"*"redis-server (pid 4242)"* ]] || fail "conflict reported after the command: $out"
+    [[ "$out" == *"6380"*"redis-server (pid 9999)"* ]] || fail "conflict reported after the command: $out"
+    assert_missing "$FAKE_DIR/master" "cleaned up"
+}
+
+test_stale_session_is_restarted() {
+    : > "$FAKE_DIR/ps"
+    local id
+    id="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    mkdir -p "$DEVHOST_STATE_DIR/sessions"
+    echo "$PWD" > "$DEVHOST_STATE_DIR/sessions/$id"     # left behind by a crash
+    run_devhost run -- true 2>/dev/null || fail "run"
+    assert_file_has "$FAKE_DIR/ssh.log" "-M -N -f" "master opened despite stale session file"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync create" "sync created despite stale session file"
+    assert_missing "$DEVHOST_STATE_DIR/sessions/$id" "session cleaned up afterwards"
+}
+
+test_start_forwarder_cancels_forwards_left_behind() {
+    : > "$FAKE_DIR/ps"
+    mkdir -p "$DEVHOST_STATE_DIR"
+    echo "6379 deadbeefdead oldredis" > "$DEVHOST_STATE_DIR/forwards"  # forwarder died, master kept it
+    touch "$FAKE_DIR/master"
+    run_devhost up 2>/dev/null || fail "up"
+    assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:6379:127.0.0.1:6379" "leftover forward cancelled"
+    assert_eq "$(cat "$DEVHOST_STATE_DIR/conflicts")" "" "no conflicts from leftovers"
+    run_devhost down 2>/dev/null || fail "down"
+}
+
+test_master_owned_listener_is_not_a_conflict() {
+    load
+    touch "$FAKE_DIR/master"                       # fake -O check reports pid 4242
+    echo "6379 ssh 4242" > "$FAKE_DIR/busy-ports"  # the master already holds the port
+    printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
+    echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
+    reconcile 2>/dev/null
+    assert_eq "$(cat "$CONFLICTS_FILE" 2>/dev/null)" "" "no conflict"
+    assert_file_has "$FORWARDS_FILE" "6379 abc123def456 redis" "adopted as a forward"
+}
+
+test_forwarder_reconnects_when_stream_ends() {
+    : > "$FAKE_DIR/ps"
+    echo "80/tcp -> 127.0.0.1:48082" > "$FAKE_DIR/port.eeee00000001"
+    printf 'start eeee00000001 nginx\n' > "$FAKE_DIR/events"
+    echo 0 > "$FAKE_DIR/events-hold"               # stream ends right after the event
+    run_devhost up 2>/dev/null || fail "up"
+    # Reconnect waits 1s, then re-reconciles and re-follows; allow for slow process spawning.
+    sleep 6
+    [[ "$(grep -c -- '-O forward -L 127.0.0.1:48082:' "$FAKE_DIR/ssh.log")" -ge 2 ]] ||
+        fail "forward re-established after the stream ended; forwarder log:
+$(cat "$DEVHOST_STATE_DIR/forwarder.log")"
+    assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:48082:" "forward dropped while disconnected"
+    assert_exists "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder still running"
+    run_devhost down 2>/dev/null || fail "down"
+    assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder stopped"
+}
+
+test_up_refuses_remote_dir_not_owned() {
+    : > "$FAKE_DIR/ps"
+    echo "mkdir -p" > "$FAKE_DIR/ssh-remote-fail"
+    local out rc=0
+    out="$(run_devhost up 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "up fails"
+    [[ "$out" == *"allow-path.sh alice"* ]] || fail "points at allow-path.sh: $out"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions" 2>/dev/null)" "" "no sync created"
+    assert_missing "$FAKE_DIR/master" "master torn down after the failed up"
+    assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder torn down after the failed up"
+}
+
+test_flush_reports_conflicts_during_up() {
+    : > "$FAKE_DIR/ps"
+    run_devhost up 2>/dev/null || fail "up"
+    echo "6379|abc123def456|redis|port already in use on this laptop by redis-server (pid 4242)" >> "$DEVHOST_STATE_DIR/conflicts"
+    local out rc=0
+    out="$(run_devhost flush 2>&1)" || rc=$?
+    assert_eq "$rc" "1" "flush fails on conflicts"
+    [[ "$out" == *"127.0.0.1:6379"*"redis-server (pid 4242)"* ]] || fail "flush reports the conflict: $out"
+    out="$(run_devhost status 2>/dev/null)"
+    [[ "$out" == CONFLICTS* ]] || fail "status leads with conflicts: $out"
+    run_devhost down 2>/dev/null || fail "down"
+}
+
+test_reconcile_then_die_with_full_length_id() {
+    load
+    local long="abc123def4560000000000000000000000000000000000000000000000000000"
+    printf '%s redis\n' "$long" > "$FAKE_DIR/ps"                 # --no-trunc IDs
+    echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
+    reconcile 2>/dev/null
+    assert_file_has "$FORWARDS_FILE" "6379 $long redis" "recorded with the full ID"
+    reconcile 2>/dev/null
+    assert_file_lacks "$FAKE_DIR/ssh.log" "-O cancel" "second reconcile keeps the forward (IDs compare equal)"
+    handle_event die "$long" redis 2>/dev/null
+    assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:6379:" "die with the full ID cancels"
+    assert_eq "$(cat "$FORWARDS_FILE")" "" "forgotten"
+}
+
+test_empty_devhostignore_syncs_everything() {
+    load
+    printf '# nothing ignored\n\n' > .devhostignore
+    start_sync 2>/dev/null
+    assert_file_has "$FAKE_DIR/mutagen.log" "--sync-mode two-way-resolved $PWD alice@devhost:$PWD" "no --ignore arguments"
+}
+
+test_flush_has_a_deadline() {
+    load
+    start_sync 2>/dev/null
+    touch "$FAKE_DIR/mutagen-flush-hang"
+    local out start end
+    start=$(date +%s)
+    out="$(DEVHOST_FLUSH_TIMEOUT=1 FLUSH_TIMEOUT=1 flush_sync 2>&1)"
+    end=$(date +%s)
+    [[ $((end - start)) -le 3 ]] || fail "flush returned after $((end - start))s"
+    [[ "$out" == *"did not finish within 1s"* ]] || fail "timeout warning: $out"
 }
 
 test_run_with_sync_disabled() {
@@ -316,10 +440,13 @@ run_test() {
     teardown
 }
 
+# Usage: tests/devhost.test.sh [test_name...]   (default: all)
 main() {
-    local t
+    local t tests
+    tests="$*"
+    [[ -n "$tests" ]] || tests="$(declare -F | awk '{ print $3 }' | grep '^test_' | sort)"
     echo "devhost tests"
-    for t in $(declare -F | awk '{ print $3 }' | grep '^test_' | sort); do
+    for t in $tests; do
         run_test "$t"
     done
     echo "$PASS passed, $FAIL failed"

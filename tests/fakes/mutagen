@@ -2,6 +2,7 @@
 # Fake mutagen for tests. State in $FAKE_DIR:
 #   mutagen-sessions   names of existing sessions, one per line
 #   mutagen-status     text printed by `sync list <name>` (e.g. a permission problem)
+#   mutagen-flush-hang if present, `sync flush` blocks for 30s (VM gone away)
 # Every invocation is appended to $FAKE_DIR/mutagen.log.
 set -u
 echo "mutagen $*" >> "$FAKE_DIR/mutagen.log"
@@ -32,6 +33,9 @@ case "$sub" in
         ;;
     flush)
         grep -qx "${1:-}" "$sessions" || exit 1
+        if [[ -f "$FAKE_DIR/mutagen-flush-hang" ]]; then
+            sleep 30
+        fi
         ;;
     terminate)
         grep -v -x "${1:-}" "$sessions" > "$sessions.tmp" || true

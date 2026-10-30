@@ -7,9 +7,11 @@
 #   sudo ./allow-path.sh alice /Users/alice        # macOS laptop
 #   sudo ./allow-path.sh bob   /home/bob/work      # Linux laptop
 #
-# Parent directories are created root-owned (0755); the final path is owned by
-# the developer. If any component already exists and belongs to a different
-# non-root user, the script refuses: two developers must not share a directory.
+# Parent directories are created root-owned (0755); the final path is created
+# owned by the developer. Only directories this script creates change owner: if
+# the final path already exists and is root's (e.g. /home passed by mistake) or
+# another developer's, the script refuses, because two developers must not
+# share a directory and system directories must stay root's.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -56,6 +58,11 @@ for part in "${parts[@]}"; do
             echo "checkout location on the laptop rather than sharing the directory." >&2
             exit 1
         fi
+        if [[ "$current" == "$path" && "$owner" == root ]]; then
+            echo "Refusing: $path already exists and is owned by root; not handing it to $user." >&2
+            echo "Pass the developer's own prefix, e.g. /Users/<name> or /home/<name>." >&2
+            exit 1
+        fi
     elif [[ "$current" == "$path" ]]; then
         install -d -m 0755 -o "$user" -g "$user" "$current"
         echo "==> Created $current (owner $user)"
@@ -65,9 +72,4 @@ for part in "${parts[@]}"; do
     fi
 done
 
-owner="$(stat -c %U "$path")"
-if [[ "$owner" != "$user" ]]; then
-    chown "$user:$user" "$path"
-    echo "==> $path now owned by $user"
-fi
 echo "==> $user can sync projects under $path"

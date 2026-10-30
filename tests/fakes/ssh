@@ -3,6 +3,8 @@
 #   master            exists while a control master is "running"
 #   ssh-down          if present, connections fail after 1s like a saved VM
 #   ssh-fail-ports    host ports for which `-O forward` fails (one per line)
+#   ssh-remote-fail   if present, remote commands containing this text exit 1
+# `-O check` reports the master as pid 4242.
 # Every invocation is appended to $FAKE_DIR/ssh.log.
 set -u
 echo "ssh $*" >> "$FAKE_DIR/ssh.log"
@@ -24,7 +26,10 @@ mode="$ctl"
 if [[ -n "$mode" ]]; then
     case "$mode" in
         check)
-            [[ -f "$FAKE_DIR/master" ]] && exit 0
+            if [[ -f "$FAKE_DIR/master" ]]; then
+                echo "Master running (pid=4242)" >&2
+                exit 0
+            fi
             echo "Control socket connect: No such file or directory" >&2
             exit 255
             ;;
@@ -61,6 +66,9 @@ fi
 # Remote command: "$1" is the target, the rest is the command.
 shift
 echo "ssh-remote $*" >> "$FAKE_DIR/ssh.log"
+if [[ -f "$FAKE_DIR/ssh-remote-fail" ]] && [[ "$*" == *"$(cat "$FAKE_DIR/ssh-remote-fail")"* ]]; then
+    exit 1
+fi
 case "$*" in
     "docker version"*) echo "27.0.0" ;;
 esac
