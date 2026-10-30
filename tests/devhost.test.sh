@@ -31,9 +31,11 @@ wait_for() {
     done
 }
 
-# Fresh fake state + devhost state + project dir for each test.
+# Fresh fake state + devhost state + project dir for each test. The physical
+# path: devhost resolves symlinks (macOS /var/folders -> /private/var/...),
+# and tests that hash $PWD themselves must see the same path.
 setup() {
-    TMP="$(mktemp -d)"
+    TMP="$(cd "$(mktemp -d)" && pwd -P)"
     export FAKE_DIR="$TMP/fake"
     export DEVHOST_STATE_DIR="$TMP/state"
     PROJECT="$TMP/project"
@@ -655,7 +657,7 @@ test_forwarder_reconnects_when_stream_ends() {
     run_devhost up 2>/dev/null || fail "up"
     # Reconnect backs off 2s, then reconciles (ps is empty, so the forward goes)
     # and re-follows (the start event adds it again).
-    # shellcheck disable=SC2329  # invoked through wait_for
+    # shellcheck disable=SC2329,SC2317  # invoked through wait_for
     forward_count() { [[ "$(grep -c -- '-O forward -L 127.0.0.1:48082:' "$FAKE_DIR/ssh.log")" -ge 2 ]]; }
     wait_for 30 "the forward to be re-established after the stream ended" forward_count
     assert_file_has "$FAKE_DIR/ssh.log" "-O cancel -L 127.0.0.1:48082:" "forward dropped while disconnected"
