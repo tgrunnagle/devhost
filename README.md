@@ -17,7 +17,7 @@ Developers run `docker`, `docker build` and `docker compose` from their own lapt
 | `host/New-DevHostVM.ps1` | Windows host (admin) | Creates the External switch and the VM |
 | `config.example.psd1` | Windows host | Template for per-machine settings |
 | `guest/install-docker.sh` | VM | Installs and configures Docker Engine |
-| `guest/add-dev-user.sh` | VM | Gives a developer SSH + Docker access |
+| `guest/add-dev-user.sh` | VM | Gives a developer SSH access and their own rootless Docker daemon |
 | `client/add-devhost-context.sh` | macOS / Linux laptop | Creates the `devhost` Docker context |
 | `client/Add-DevHostContext.ps1` | Windows laptop | Same, for Windows |
 
@@ -68,7 +68,9 @@ Copy the `guest/` scripts to the VM (e.g. `scp -r guest you@devhost:`), then:
 sudo ./guest/install-docker.sh
 ```
 
-This installs Docker Engine, Buildx and Compose from Docker's apt repository, rotates container logs (10 MB × 3 per container), raises sshd's session limits for Docker over SSH, and adds you to the `docker` group.
+This installs Docker Engine, Buildx and Compose from Docker's apt repository, rotates container logs (10 MB × 3 per container), raises sshd's session limits for Docker over SSH, and adds you to the `docker` group. It also prepares the VM for per-user rootless daemons (step 4): the rootless extras, an AppArmor profile that lets `rootlesskit` create user namespaces, cgroup v2 controller delegation to user services, and the iptables kernel modules kind needs.
+
+It's safe to re-run, and you need to re-run it on a VM set up before per-user daemons existed.
 
 ## 4. Add developers (inside the VM)
 
@@ -78,7 +80,17 @@ Get each developer's SSH **public** key (e.g. `~/.ssh/id_ed25519.pub`), copy it 
 sudo ./guest/add-dev-user.sh alice alice.pub
 ```
 
-> **Security:** anyone in the `docker` group is effectively root on the VM. Only add people you trust, and don't expose the VM beyond your LAN.
+Each developer gets their own **rootless Docker daemon**, which runs as their user on the VM. They aren't in the `docker` group. `DOCKER_HOST` in their `~/.ssh/environment` points SSH sessions at their own daemon, so their laptop's Docker context reaches it with no extra setup. Re-running the script for an existing user switches them to rootless mode and removes them from the `docker` group.
+
+### Shared daemon (opt-in)
+
+```bash
+sudo ./guest/add-dev-user.sh --shared alice alice.pub
+```
+
+This adds the user to the `docker` group, so they use the VM's single rootful daemon. Everyone in shared mode shares containers, volumes, networks, images, build cache and Compose project names, and can see and remove each other's. The upside is one copy of each image and one build cache. Users in different modes don't see each other's resources.
+
+> **Security:** anyone in the `docker` group is effectively root on the VM. Rootless users aren't: a `--privileged` container that mounts `/` still runs as the developer's own UID and can't change anything they couldn't change anyway. Only add people you trust, and don't expose the VM beyond your LAN.
 
 ## 5. Connect a laptop
 
@@ -103,10 +115,13 @@ Your SSH key must load without a prompt (via ssh-agent, or no passphrase), becau
 
 ## Using the shared host
 
-- **Ports:** `docker run -p 8080:80 …` is reachable at `http://devhost:8080`. Agree on port ranges per developer to avoid collisions.
+- **Your own daemon:** containers, volumes, networks, images, build cache and Compose projects are per developer. Two people running `docker compose up` from checkouts with the same directory name get separate projects, and fixed names (`--name`, named volumes, kind clusters) don't collide. `docker system prune`, `docker volume prune` and `docker compose down -v` only touch your own resources.
+- **Ports are still shared.** Every daemon publishes on the VM's one network stack, so two developers can't both publish host port `6379`; the second gets `port is already allocated`. Binding to `127.0.0.1` doesn't help, because that's the VM's loopback. Prefer ephemeral host ports (`-p 127.0.0.1::6379`, then `docker port <container>` to find it). For ports that must be fixed, agree on a port range per developer. `docker run -p 8080:80 …` is reachable at `http://devhost:8080`.
+- **No ports below 1024 in rootless mode.** Publish `8080:80`, not `80:80`. To allow low ports for everyone, set `net.ipv4.ip_unprivileged_port_start=0` with `sysctl` on the VM.
 - **Bind mounts refer to the VM's filesystem, not your laptop.** `-v ./src:/app` mounts a folder on the VM. Bake code into images or use named volumes. `docker build` works normally; the build context is uploaded from your laptop.
-- **Firewall:** ports published by Docker bypass `ufw`, because Docker manages iptables directly. Keep the VM on a trusted network.
-- **Cleanup:** images and build cache add up on a shared host. Run `docker system prune` periodically.
+- **kind:** works on rootless Docker because `install-docker.sh` delegates cgroup v2 controllers to user services (`Delegate=` in `user@.service`) and loads the iptables modules. Cluster names are per developer. The cluster's API server is published on the VM's `127.0.0.1`, so run `kubectl` on the VM (`ssh devhost`) or forward the port from your laptop (`ssh -L <port>:127.0.0.1:<port> devhost`, with the port from the kubeconfig's `server:` line).
+- **Firewall:** ports published by the shared daemon bypass `ufw`, because Docker manages iptables directly. Rootless daemons publish ports through ordinary listening sockets, so `ufw` rules do apply to them. Keep the VM on a trusted network either way.
+- **Disk:** every developer pulls and builds their own images, under `~/.local/share/docker` on the VM, so disk use grows with the number of developers. Run `docker system prune` periodically; it only cleans up your own daemon. To see usage per developer, run `sudo du -sh /home/*/.local/share/docker` on the VM. Users in shared mode share one copy of each image.
 
 ## Operating the VM (Windows host)
 

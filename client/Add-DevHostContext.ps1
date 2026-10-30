@@ -24,7 +24,7 @@ Write-Host "==> Checking SSH access to $target"
 # accept-new records the host key on first connect so later Docker calls don't prompt.
 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $target docker version --format '{{.Server.Version}}' | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not run docker on $target over SSH. Check that your key is authorized and that $User is in the docker group on the host."
+    throw "Could not run docker on $target over SSH. Check that your key is authorized and that $User was set up with guest/add-dev-user.sh on the host."
 }
 
 # Avoids redirecting native stderr, which Windows PowerShell 5.1 turns into a terminating error here.

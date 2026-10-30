@@ -21,7 +21,7 @@ echo "==> Checking SSH access to $user@$host"
 # accept-new records the host key on first connect so later Docker calls don't prompt.
 if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$user@$host" docker version --format '{{.Server.Version}}' >/dev/null; then
     echo "Could not run docker on $user@$host over SSH. Check that your key is authorized" >&2
-    echo "and that $user is in the docker group on the host." >&2
+    echo "and that $user was set up with guest/add-dev-user.sh on the host." >&2
     exit 1
 fi
 
