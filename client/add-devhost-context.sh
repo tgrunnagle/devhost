@@ -37,8 +37,10 @@ else
 fi
 
 ssh_config="$HOME/.ssh/config"
-begin="# BEGIN devhost-context $name"
-end="# END devhost-context $name"
+# Keyed by host, so re-running with a different host (say, the IP instead of a
+# flaky DNS name) adds a block for it instead of tripping over the old one.
+begin="# BEGIN devhost $host"
+end="# END devhost $host"
 # Docker passes its own ConnectTimeout=30 on the ssh command line, which wins over
 # this file, so ConnectTimeout here only speeds up plain ssh. The keepalives drop
 # sessions to a VM that went away, and ControlMaster lets docker calls share one
@@ -65,12 +67,12 @@ print_block() {
 }
 
 if [[ "$existing" == "$block" ]]; then
-    echo "==> $ssh_config already has the devhost block"
+    echo "==> $ssh_config already has the devhost block for $host"
 elif [[ -n "$existing" ]]; then
-    echo "==> $ssh_config has a devhost block that differs from this one; leaving it alone."
+    echo "==> $ssh_config has an edited devhost block for $host; leaving it alone."
     echo "    The script would write:"
     print_block
-elif [[ -f "$ssh_config" ]] && awk -v h="$host" 'tolower($1) == "host" { for (i = 2; i <= NF; i++) if ($i == h) found = 1 } END { exit !found }' "$ssh_config"; then
+elif [[ -f "$ssh_config" ]] && awk -v h="$host" '{ sub(/^[ \t]+/, ""); n = split($0, f, /[ \t=]+/) } tolower(f[1]) == "host" { for (i = 2; i <= n; i++) if (f[i] == h) found = 1 } END { exit !found }' "$ssh_config"; then
     echo "==> $ssh_config already has a Host entry for $host; leaving it alone."
     echo "    Consider adding these settings to it:"
     print_block

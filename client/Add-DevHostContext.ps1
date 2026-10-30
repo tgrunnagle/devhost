@@ -41,8 +41,10 @@ if ((docker context ls --format '{{.Name}}') -contains $Name) {
 if ($LASTEXITCODE -ne 0) { throw "docker context command failed." }
 
 $sshConfig = Join-Path $HOME '.ssh\config'
-$begin = "# BEGIN devhost-context $Name"
-$end = "# END devhost-context $Name"
+# Keyed by host, so re-running with a different host (say, the IP instead of a
+# flaky DNS name) adds a block for it instead of tripping over the old one.
+$begin = "# BEGIN devhost $HostName"
+$end = "# END devhost $HostName"
 # Docker passes its own ConnectTimeout=30 on the ssh command line, which wins over
 # this file, so ConnectTimeout here only speeds up plain ssh. The keepalives drop
 # sessions to a VM that went away. Windows OpenSSH has no ControlMaster support.
@@ -64,14 +66,14 @@ foreach ($line in $lines) {
     if ($inBlock) { $existing += $line }
     if ($line -eq $end) { $inBlock = $false }
 }
-$hasHost = [bool]($lines | Where-Object { $_ -match '^\s*Host\s+(.+)$' -and (-split $Matches[1]) -contains $HostName })
+$hasHost = [bool]($lines | Where-Object { $_ -match '^\s*Host(?:\s*=\s*|\s+)(.+)$' -and (-split $Matches[1]) -contains $HostName })
 
 function Write-Block { Write-Host ""; $block | ForEach-Object { Write-Host $_ }; Write-Host "" }
 
 if (($existing -join "`n") -ceq ($block -join "`n")) {
-    Write-Host "==> $sshConfig already has the devhost block"
+    Write-Host "==> $sshConfig already has the devhost block for $HostName"
 } elseif ($existing.Count -gt 0) {
-    Write-Host "==> $sshConfig has a devhost block that differs from this one; leaving it alone."
+    Write-Host "==> $sshConfig has an edited devhost block for $HostName; leaving it alone."
     Write-Host "    The script would write:"
     Write-Block
 } elseif ($hasHost) {

@@ -185,4 +185,5 @@ docker context use default    # if you ran `docker context use devhost`
 Then opt in only when the VM is reachable (see [Use devhost only when it's reachable](#use-devhost-only-when-its-reachable)). Other things to check:
 
 - **Long-running commands** (`docker events`, `logs -f`, an attached `compose up`) that hang after the VM was saved need `ServerAliveInterval` in `~/.ssh/config`. Without it, SSH never notices that the VM is gone.
+- **Stale shared connection (macOS / Linux):** with `ControlMaster`, new docker calls reuse the connection left open from earlier calls. If the VM went away, they hang until the keepalives drop that connection (about 45s), and Docker's 30s connect timeout doesn't apply. Close it right away with `ssh -O exit 192.168.1.50` (the host from your context).
 - **DNS:** names like `devhost.lan` can stall when the router isn't sure about them. Point the context at the IP from the VM's reserved DHCP lease instead: `./client/add-devhost-context.sh 192.168.1.50 alice`.
