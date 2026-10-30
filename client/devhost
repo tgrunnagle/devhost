@@ -132,14 +132,18 @@ if ! flock -n 9; then
 fi
 
 # Remove the holder record before the lock is released (fd 9 closes on exit).
-trap 'rm -f "$info"' EXIT
+trap 'rm -f "$info"; [ -z "${!:-}" ] || kill "$!" 2>/dev/null' EXIT
 trap 'exit 129' HUP
 trap 'exit 141' PIPE
 trap 'exit 143' TERM
 printf '%s\t%s\t%s\t%s\n' "$(id -un)" "$client" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" >"$info.$$"
 mv -f "$info.$$" "$info"
 echo ACQUIRED
-cat >/dev/null 9<&-
+# Hold until the laptop closes stdin. cat runs in the background so signals reach
+# this shell right away, and keeps no stdout/stderr so the SSH session (which the
+# laptop watches) ends as soon as this shell does, even if cat lingers.
+cat 0<&0 >/dev/null 2>&1 9<&- &
+wait $!
 EOF
 
 # Remote side of `lock --list`. Skips holder records whose shell is gone (only
@@ -198,7 +202,7 @@ cmd_lock() {
     # The SSH session's stdin is a FIFO only this script holds open: closing it (or
     # this script dying) ends the session and releases the lock. Its stdout tells us
     # when the lock is acquired.
-    local tmp remote ssh_pid line rc ssh_rc
+    local tmp remote ssh_pid line rc cmd_pid watch_pid sig
     remote="$(remote_bash "$LOCK_SCRIPT" "$name" "$mode" "$timeout" "$(hostname)")"
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/devhost-lock.XXXXXX")"
     mkfifo "$tmp/in" "$tmp/out"
@@ -219,17 +223,40 @@ cmd_lock() {
         die "could not take lock '$name' (ssh exited with $rc)"
     fi
 
-    rc=0
-    "$@" 7<&- 8>&- || rc=$?
+    # Run the command as a child we wait on, so INT, TERM or HUP sent to this script
+    # reach the command and the lock is held until it has exited. Background children
+    # start with SIGINT ignored and stdin from /dev/null; undo both.
+    (trap - INT QUIT; exec "$@") 0<&0 7<&- 8>&- &
+    cmd_pid=$!
+    # ssh prints nothing after ACQUIRED, so EOF on its stdout means the session (and
+    # with it the lock) is gone. Say so right away, not when the command finishes.
+    (
+        trap 'exit 0' TERM
+        IFS= read -r _ <&7 || true
+        echo "$prog: warning: lost the connection holding lock '$name'; the VM has" \
+            "released it, and others can take it while your command still runs." >&2
+    ) 0</dev/null 8>&- &
+    watch_pid=$!
+    exec 7<&-
+    for sig in INT TERM HUP; do
+        # shellcheck disable=SC2064  # bind $sig now
+        trap "kill -$sig \"\$cmd_pid\" 2>/dev/null || true" "$sig"
+    done
 
-    exec 8>&- 7<&-
+    # wait returns early when a trapped signal arrives; keep waiting until the
+    # command has actually exited.
+    while :; do
+        rc=0
+        wait "$cmd_pid" || rc=$?
+        kill -0 "$cmd_pid" 2>/dev/null || break
+    done
+    trap - INT TERM HUP
+
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+    exec 8>&-
     trap - EXIT
-    ssh_rc=0
-    wait "$ssh_pid" || ssh_rc=$?
-    if [[ $ssh_rc -ne 0 ]]; then
-        echo "$prog: warning: the connection holding lock '$name' failed while the command ran" \
-            "(ssh exited with $ssh_rc); the lock may have been released early." >&2
-    fi
+    wait "$ssh_pid" || true
     exit "$rc"
 }
 

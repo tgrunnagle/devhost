@@ -100,6 +100,33 @@ check "killing the holder with -9 lets the waiter proceed" test "$rc" -eq 0
 check "...promptly" test $((SECONDS - start)) -le 5
 pkill -f 'sleep 30' 2>/dev/null || true
 
+# --- TERM / HUP to devhost -------------------------------------------------------
+for sig in TERM HUP; do
+    marker="$work/term-$sig"
+    "$devhost" lock e2e -- sh -c "trap 'echo got >\"$marker\"; sleep 1; exit 3' $sig; sleep 30 & wait" &
+    a=$!
+    wait_held e2e
+    kill -"$sig" "$a"
+    sleep 0.3
+    rc=0
+    "$devhost" lock e2e --no-wait -- true 2>/dev/null || rc=$?
+    check "$sig to devhost keeps the lock until the command exits" test "$rc" -eq 75
+    rc=0
+    wait "$a" || rc=$?
+    check "...forwards $sig to the command" test -s "$marker"
+    check "...and exits with the command's code" test "$rc" -eq 3
+    pkill -f 'sleep 30' 2>/dev/null || true
+done
+
+# --- connection lost while the command runs ---------------------------------------
+"$devhost" lock e2e -- sleep 3 2>"$work/lost.err" &
+a=$!
+wait_held e2e
+pkill -f 'DEVHOST_LOCK_DIR' # the fake ssh session
+sleep 0.5
+check "warns right away when the lock's connection is lost" grep -q "lost the connection holding lock 'e2e'" "$work/lost.err"
+wait "$a" || true
+
 # --- waiter killed -----------------------------------------------------------------
 "$devhost" lock e2e -- sleep 2 &
 a=$!
@@ -132,6 +159,17 @@ rc=0
 DEVHOST_LOCK_DIR="$work/missing" "$devhost" lock e2e -- true 2>"$work/missing.err" || rc=$?
 check "fails when the lock directory is missing" test "$rc" -eq 1
 check "...and says why" grep -q "missing or not writable" "$work/missing.err"
+
+# What a user outside the devhost group hits. Root can write anywhere, so skip there.
+if [[ $EUID -ne 0 ]]; then
+    mkdir -m 0555 "$work/readonly"
+    rc=0
+    DEVHOST_LOCK_DIR="$work/readonly" "$devhost" lock e2e -- true 2>"$work/ro.err" || rc=$?
+    check "fails when the lock directory isn't writable" test "$rc" -eq 1
+    check "...and points at the devhost group" grep -q "in the devhost group" "$work/ro.err"
+else
+    echo "skip - unwritable lock directory (running as root)"
+fi
 
 echo
 if [[ $failures -gt 0 ]]; then

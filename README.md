@@ -21,7 +21,8 @@ Developers run `docker`, `docker build` and `docker compose` from their own lapt
 | `client/add-devhost-context.sh` | macOS / Linux laptop | Creates the `devhost` Docker context |
 | `client/Add-DevHostContext.ps1` | Windows laptop | Same, for Windows |
 | `client/devhost` | macOS / Linux laptop | Helper commands: `devhost lock` for host-wide locks |
-| `tests/devhost-lock.test.sh` | Linux | Tests for `devhost lock` |
+| `tests/devhost-lock.test.sh` | Linux | Tests for `devhost lock` (fake `ssh`, no VM needed) |
+| `tests/devhost-lock.e2e.sh` | Disposable container | End-to-end `devhost lock` test with a real sshd (see its header) |
 
 ## Requirements
 
@@ -129,8 +130,11 @@ NAME                 USER         HOST                     SINCE
 e2e                  alice        alice-mbp                2026-10-29T14:02:11Z
 ```
 
-The command runs on your laptop as usual, and `devhost lock` exits with its exit code. While it runs, an SSH session to the VM holds `flock` on `/run/lock/devhost/<name>.lock`, and the lock goes away with that session. There are no stale locks to clean up: the VM releases the lock when the command finishes, when the script is killed (even with `kill -9`), or within about 40 seconds when the laptop sleeps or loses the network.
+The command runs on your laptop as usual, and `devhost lock` exits with its exit code. Ctrl-C, `TERM` and `HUP` sent to `devhost lock` are passed to the command, and the lock is held until the command exits. While it runs, an SSH session to the VM holds `flock` on `/run/lock/devhost/<name>.lock`, and the lock goes away with that session. There are no stale locks to clean up: the VM releases the lock when the command finishes, when the script is killed (even with `kill -9`), or within about 40 seconds when the laptop sleeps or loses the network.
 
+- If the connection drops while the command runs, the lock is released but the command keeps going; `devhost lock` prints a warning as soon as that happens.
+- Exit code 75 means the lock wasn't taken, unless your command also exits 75. The "is held by" or "timed out" message on stderr tells the two apart.
+- Put `client/devhost` on your `PATH` (e.g. `ln -s "$PWD/client/devhost" ~/.local/bin/devhost`) so project scripts can call `devhost`.
 - The VM is found through the `devhost` Docker context. Set `DEVHOST_CONTEXT` to use another context, or `DEVHOST_SSH=user@host` to skip Docker.
 - Only members of the VM's `devhost` group can take or list locks; `add-dev-user.sh` adds developers to it. If your VM was set up before this existed, re-run `install-docker.sh`, then `add-dev-user.sh` for each developer.
 - Locks are host-wide across all users: the VM's CPU, memory and ports are shared no matter whose daemon or containers use them.
@@ -138,14 +142,15 @@ The command runs on your laptop as usual, and `devhost lock` exits with its exit
 
 ### Key locks on the daemon, not the machine
 
-In project scripts, choose the lock by **where the Docker daemon runs**, not where the script runs. If the daemon is reached over SSH, lock on its host; otherwise keep the local lock:
+In project scripts, choose the lock by **where the Docker daemon runs**, not where the script runs. If the daemon is reached over SSH, lock on that host; otherwise keep the local lock:
 
 ```bash
 # Run the rest of this script under the 'e2e' lock, on whichever machine runs the daemon.
 if [ -z "${E2E_LOCKED:-}" ]; then
     export E2E_LOCKED=1
-    case "${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}" in
-        ssh://*) exec devhost lock e2e -- "$0" "$@" ;;   # remote daemon: lock on its host
+    daemon="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}"
+    case "$daemon" in
+        ssh://*) DEVHOST_SSH="$daemon" exec devhost lock e2e -- "$0" "$@" ;;   # remote daemon: lock on its host
     esac
     exec 9>/tmp/e2e.lock && flock 9                     # local daemon: lock on this machine
 fi
