@@ -113,12 +113,20 @@ if $shared; then
     set_ssh_docker_host ""
     echo "==> $user uses the shared daemon (docker group)"
     if [[ -f "$home/.config/systemd/user/docker.service" ]]; then
-        echo "    Their rootless daemon is still installed but no longer used over SSH."
+        # Stop it so its containers don't keep holding ports nobody can reach any more.
+        if [[ -S "/run/user/$uid/bus" ]]; then
+            as_user systemctl --user disable --now docker.service || true
+        fi
+        echo "    Stopped their rootless daemon. Its images and volumes are kept in"
+        echo "    $home/.local/share/docker; re-run without --shared to switch back."
     fi
 else
     if id -nG "$user" | tr ' ' '\n' | grep -qx docker; then
         gpasswd -d "$user" docker >/dev/null
         echo "==> Removed $user from the docker group"
+        echo "    Containers they started on the shared daemon keep running and holding their"
+        echo "    ports, but $user can no longer see them. Remove them first with"
+        echo "    'sudo docker ps -a' / 'sudo docker rm -f <id>' if they're no longer wanted."
     fi
 
     echo "==> Setting up rootless Docker for $user"
@@ -135,9 +143,36 @@ else
         exit 1
     fi
 
+    # The Delegate= drop-in from install-docker.sh only applies when the user's service
+    # manager starts; one already running (a logged-in or lingering user) lacks it.
+    controllers="/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/cgroup.controllers"
+    if ! grep -qw cpuset "$controllers" 2>/dev/null; then
+        echo "    Warning: cgroup controllers aren't delegated to $user's session yet, so kind"
+        echo "    and container resource limits won't work. Fix: sudo systemctl restart user@$uid.service"
+        echo "    (stops $user's running containers), or reboot the VM."
+    fi
+
+    # Rootless daemons don't read /etc/docker/daemon.json; give each the same log rotation.
+    config_dir="$home/.config/docker"
+    restart_daemon=false
+    if [[ ! -f "$config_dir/daemon.json" ]]; then
+        runuser -u "$user" -- mkdir -p "$config_dir"
+        cat > "$config_dir/daemon.json" <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+EOF
+        chown "$user:$user" "$config_dir/daemon.json"
+        restart_daemon=true
+    fi
+
     # --force: the rootful daemon is running too; that's expected here.
     as_user dockerd-rootless-setuptool.sh install --force
     as_user systemctl --user enable --now docker.service
+    if $restart_daemon; then
+        as_user systemctl --user restart docker.service
+    fi
 
     socket="unix:///run/user/$uid/docker.sock"
     set_ssh_docker_host "$socket"
