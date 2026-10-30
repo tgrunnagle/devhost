@@ -1266,25 +1266,21 @@ RUN_MODE=""
 RUN_DONE=0
 RUN_STARTING=0      # inside session_start: nothing is registered yet
 RUN_REGISTERED=0    # this run is registered under the session
-RUN_CHILD=""        # pid of the command while it runs
-RUN_INTERRUPTED=0
-RUN_TERM_SENT=0
+RUN_IN_COMMAND=0    # the command is running (as a foreground child)
 
-# Signals while the command runs. A terminal's Ctrl-C reaches the command
-# directly (same process group, default disposition restored in cmd_run),
-# so INT is only noted, never forwarded: a second INT would make e.g.
-# `docker compose up` force-kill instead of stopping cleanly. TERM and HUP
-# (timeout, CI cancel, closed terminal) are passed on to the command once.
-# Before the command starts, any of them aborts the startup; the EXIT trap
-# cleans up.
+# Signals. Before the command starts, INT/TERM/HUP abort the startup and the
+# EXIT trap cleans up. The command itself runs as a foreground child in our
+# process group: Ctrl-C, `timeout`, a closed terminal and CI cancels signal
+# the whole group, so they reach the command directly and it decides what to
+# do; bash runs this trap only once the command has exited, and we then
+# carry on with the command's exit status. (A signal aimed at the devhost
+# pid alone therefore takes effect when the command exits. A background job
+# would let us relay it at once, but bash 3.2, which macOS ships, starts
+# background jobs with INT ignored and does not let them undo that, so
+# Ctrl-C would never reach the command.)
 on_run_signal() {
-    local sig="$1" code="$2"
-    RUN_INTERRUPTED=1
-    [[ -n "$RUN_CHILD" ]] || exit "$code"
-    if [[ "$sig" != INT && $RUN_TERM_SENT -eq 0 ]]; then
-        RUN_TERM_SENT=1
-        kill -s "$sig" "$RUN_CHILD" 2>/dev/null || true
-    fi
+    local code="$1"
+    [[ $RUN_IN_COMMAND -eq 1 ]] || exit "$code"
 }
 
 run_cleanup() {
@@ -1317,7 +1313,7 @@ run_cleanup() {
 }
 
 cmd_run() {
-    local rc=0 prev=0 mode snapshot pre
+    local rc=0 mode snapshot pre
     [[ "${1:-}" == "--" ]] && shift
     [[ $# -gt 0 ]] || die "usage: devhost run [--] <command...>"
     check_conflict_mode
@@ -1326,9 +1322,9 @@ cmd_run() {
     pre="$STATE_DIR/conflicts.pre.$$"
     snapshot="$STATE_DIR/conflicts.run.$$"
     trap 'run_cleanup; rm -f "$STATE_DIR/conflicts.pre.$$" "$STATE_DIR/conflicts.run.$$"' EXIT
-    trap 'on_run_signal INT 130' INT
-    trap 'on_run_signal TERM 143' TERM
-    trap 'on_run_signal HUP 129' HUP
+    trap 'on_run_signal 130' INT
+    trap 'on_run_signal 143' TERM
+    trap 'on_run_signal 129' HUP
     lock_acquire
     if session_active; then
         RUN_MODE="$(session_mode)"
@@ -1345,27 +1341,13 @@ cmd_run() {
     precheck_conflicts "$pre" || exit 1
     # The command must not run against a half-synced checkout on the VM.
     flush_sync || { log "not running the command: the checkout is not fully synced"; exit 1; }
-    # Run the command as a background job and wait for it, so signals reach
-    # this shell while it runs (a foreground child would hold them until it
-    # exits). bash starts background jobs with INT and QUIT ignored; the
-    # subshell restores them so Ctrl-C reaches the command as usual. <&0
-    # keeps the command's stdin, which `&` would otherwise drop.
-    ( trap - INT QUIT; DOCKER_CONTEXT="$CONTEXT" exec "$@" ) <&0 &
-    RUN_CHILD=$!
-    while :; do
-        RUN_INTERRUPTED=0
-        rc=0
-        wait "$RUN_CHILD" 2>/dev/null || rc=$?
-        [[ $RUN_INTERRUPTED -eq 1 ]] || break   # the command is done
-        # The status above is the signal's, not the command's: wait again.
-        # 127 means the command was already collected by an earlier wait.
-        if [[ $rc -eq 127 ]]; then
-            rc=$prev
-            break
-        fi
-        prev=$rc
-    done
-    RUN_CHILD=""
+    # A foreground child: see on_run_signal for what that means for signals.
+    RUN_IN_COMMAND=1
+    set +e
+    DOCKER_CONTEXT="$CONTEXT" "$@"
+    rc=$?
+    set -e
+    RUN_IN_COMMAND=0
     # Keep the conflicts recorded meanwhile: teardown deletes the live file.
     cp -f "$CONFLICTS_FILE" "$snapshot" 2>/dev/null || : > "$snapshot"
     # Flushes outputs back (also when the command failed); the last run of a

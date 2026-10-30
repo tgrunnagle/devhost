@@ -612,17 +612,21 @@ test_interrupted_startup_leaves_nothing() {
     assert_eq "$(ls "$DEVHOST_STATE_DIR/sessions")" "" "no session registered"
 }
 
-test_run_passes_term_to_command() {
+test_group_term_reaches_command() {
     : > "$FAKE_DIR/ps"
     local pid rc=0
+    # Job control on, so devhost leads its own process group; TERM to that
+    # group is what `timeout`, a CI cancel or a closed terminal do.
+    set -m
     # shellcheck disable=SC2016
     start_devhost run -- sh -c 'trap "echo term > \"$FAKE_DIR/child-got-term\"; exit 7" TERM; touch "$FAKE_DIR/child-started"; while :; do sleep 0.1; done'
     pid=$!
+    set +m
     wait_for 30 "the command to start" test -e "$FAKE_DIR/child-started"
-    kill -TERM "$pid"
+    kill -TERM -- "-$pid"
     wait "$pid" || rc=$?
-    assert_exists "$FAKE_DIR/child-got-term" "TERM passed on to the command"
-    assert_eq "$rc" "7" "exit code is the command's"
+    assert_exists "$FAKE_DIR/child-got-term" "TERM reached the command"
+    assert_eq "$rc" "7" "exit code is the command's, not the signal's"
     assert_missing "$FAKE_DIR/master" "torn down after the signal"
     assert_missing "$DEVHOST_STATE_DIR/forwarder.pid" "forwarder stopped"
     assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "sync terminated"
