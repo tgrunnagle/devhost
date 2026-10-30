@@ -5,9 +5,13 @@
 #
 # - Installs Docker Engine, Buildx and Compose from Docker's apt repository.
 # - Rotates container logs so a chatty container can't fill the disk.
+# - Installs what per-user rootless Docker needs (see add-dev-user.sh): rootless extras,
+#   uidmap, an AppArmor profile for rootlesskit, cgroup v2 controller delegation to user
+#   services, and the iptables modules kind needs.
 # - Raises sshd session limits; Docker over SSH (and Compose especially) opens many
-#   sessions at once and hits the default limit of 10.
-# - Adds the invoking user to the docker group.
+#   sessions at once and hits the default limit of 10. Lets users set DOCKER_HOST in
+#   ~/.ssh/environment so SSH sessions reach their own rootless daemon.
+# - Adds the invoking user to the docker group (the shared, rootful daemon).
 #
 # Safe to re-run.
 set -euo pipefail
@@ -49,7 +53,8 @@ if ! apt-get update; then
 fi
 
 echo "==> Installing Docker Engine"
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    docker-ce-rootless-extras uidmap dbus-user-session slirp4netns
 
 echo "==> Configuring log rotation"
 if [[ -f /etc/docker/daemon.json ]]; then
@@ -66,11 +71,49 @@ fi
 systemctl enable --now docker containerd
 systemctl restart docker
 
-echo "==> Raising sshd session limits for Docker over SSH"
+echo "==> Preparing for per-user rootless Docker"
+# Ubuntu 24.04+ blocks unprivileged user namespaces unless an AppArmor profile allows them.
+rootlesskit_profile=/etc/apparmor.d/usr.bin.rootlesskit
+if [[ -d /etc/apparmor.d && ! -f "$rootlesskit_profile" ]]; then
+    cat > "$rootlesskit_profile" <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+/usr/bin/rootlesskit flags=(unconfined) {
+  userns,
+
+  include if exists <local/usr.bin.rootlesskit>
+}
+EOF
+    apparmor_parser -r "$rootlesskit_profile"
+fi
+
+# Rootless containers can only limit resources (and kind can only run) if systemd
+# delegates the cgroup v2 controllers to each user's service manager.
+install -d /etc/systemd/system/user@.service.d
+cat > /etc/systemd/system/user@.service.d/delegate.conf <<'EOF'
+[Service]
+Delegate=cpu cpuset io memory pids
+EOF
+systemctl daemon-reload
+
+# kind's nodes need these; a rootless daemon can't load kernel modules itself.
+cat > /etc/modules-load.d/devhost-kind.conf <<'EOF'
+ip6_tables
+ip6table_nat
+ip_tables
+iptable_nat
+EOF
+systemctl restart systemd-modules-load
+
+echo "==> Configuring sshd for Docker over SSH"
 cat > /etc/ssh/sshd_config.d/50-devhost.conf <<'EOF'
 # Docker contexts over SSH open a session per API call; Compose opens many at once.
 MaxSessions 64
 MaxStartups 64:30:128
+# add-dev-user.sh sets DOCKER_HOST in ~/.ssh/environment so `docker system dial-stdio`
+# reaches the user's own rootless daemon.
+PermitUserEnvironment DOCKER_HOST
 EOF
 sshd -t
 systemctl reload ssh
@@ -82,4 +125,4 @@ fi
 
 echo
 docker version --format 'Docker Engine {{.Server.Version}} installed.'
-echo "Next: add developers with ./add-dev-user.sh <username> <public-key-file>"
+echo "Next: add developers with ./add-dev-user.sh [--shared] <username> <public-key-file>"
