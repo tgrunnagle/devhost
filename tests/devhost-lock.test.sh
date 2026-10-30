@@ -133,14 +133,33 @@ rc=0
 wait "$a" || rc=$?
 check "...and exits with the command's code" test "$rc" -eq 3
 
-timeout 1 "$devhost" lock e2e -- sh -c "$slow_exit" &
+marker="$work/timeout-term"
+timeout --preserve-status 2 "$devhost" lock e2e -- \
+    sh -c "trap 'touch \"$marker\"; sleep 1; exit 3' TERM; sleep 30 & wait" &
 a=$!
-sleep 1.3
+wait_held e2e
+for _ in $(seq 50); do [[ -e "$marker" ]] && break; sleep 0.1; done
 rc=0
 "$devhost" lock e2e --no-wait -- true 2>/dev/null || rc=$?
 check "timeout(1) keeps the lock until the command exits" test "$rc" -eq 75
-wait "$a" || true
+rc=0
+wait "$a" || rc=$?
+check "...and the command's code comes back through timeout" test "$rc" -eq 3
 pkill -f 'sleep 30' 2>/dev/null || true
+
+# An INT sent to devhost alone is ignored: the lock and the command carry on.
+# shellcheck disable=SC2016  # perl code, not shell
+perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' "$devhost" lock e2e -- sleep 1.5 &
+a=$!
+wait_held e2e
+kill -INT "$a"
+sleep 0.3
+rc=0
+"$devhost" lock e2e --no-wait -- true 2>/dev/null || rc=$?
+check "INT to devhost alone doesn't release the lock" test "$rc" -eq 75
+rc=0
+wait "$a" || rc=$?
+check "...and the command finishes normally" test "$rc" -eq 0
 
 # Ctrl-C: the terminal sends INT to the foreground group; devhost must not add another.
 # Background jobs start with SIGINT ignored, which shells can't undo; perl can.

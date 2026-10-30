@@ -241,23 +241,26 @@ cmd_lock() {
     ) 0</dev/null 8>&- &
     watch_pid=$!
     exec 7<&-
-    # Ctrl-C and Ctrl-\ reach the command from the terminal, so only keep waiting.
+    # Ctrl-C and Ctrl-\ reach the command from the terminal, so only keep waiting
+    # (an INT or QUIT sent to this script alone is ignored too; send TERM to stop it).
     # TERM and HUP may have been sent to this script alone (kill <pid>), so pass them on.
-    trap ':' INT QUIT
+    local interrupted
+    trap 'interrupted=1' INT QUIT
     for sig in TERM HUP; do
         # shellcheck disable=SC2064  # bind $sig now
-        trap "kill -$sig \"\$cmd_pid\" 2>/dev/null || true" "$sig"
+        trap "interrupted=1; kill -$sig \"\$cmd_pid\" 2>/dev/null || true" "$sig"
     done
 
     # wait returns early when a trapped signal arrives; keep waiting until the
     # command has actually exited.
     while :; do
+        interrupted=0
         rc=0
         wait "$cmd_pid" || rc=$?
-        kill -0 "$cmd_pid" 2>/dev/null || break
+        [[ $interrupted -eq 1 ]] || break
     done
-    # If the command exited between an interrupted wait and kill -0, rc is 128+N from
-    # the signal; collect its real status (127: already collected above).
+    # If a signal arrived just as the command exited, rc may be 128+N from the
+    # signal; collect its real status (127: already collected above).
     local final=0
     wait "$cmd_pid" 2>/dev/null || final=$?
     [[ $final -eq 127 ]] || rc=$final
