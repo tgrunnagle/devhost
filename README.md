@@ -20,6 +20,8 @@ Developers run `docker`, `docker build` and `docker compose` from their own lapt
 | `guest/add-dev-user.sh` | VM | Gives a developer SSH + Docker access |
 | `client/add-devhost-context.sh` | macOS / Linux laptop | Creates the `devhost` Docker context |
 | `client/Add-DevHostContext.ps1` | Windows laptop | Same, for Windows |
+| `client/devhost-probe.sh` | macOS / Linux laptop | Exits 0 if devhost answers within 5s |
+| `client/Test-DevHost.ps1` | Windows laptop | Same, for Windows |
 
 ## Requirements
 
@@ -92,14 +94,62 @@ Windows:
 .\client\Add-DevHostContext.ps1 -HostName devhost -User alice
 ```
 
-Which name reaches the VM depends on your router's DNS: often `devhost.lan` (or `devhost.local`, `devhost.home`) rather than plain `devhost`. Check with `nslookup devhost.lan`, and use the VM's reserved IP if no name resolves reliably. Then:
-
-```bash
-docker --context devhost ps      # one-off
-docker context use devhost       # make it the default
-```
+Which name reaches the VM depends on your router's DNS: often `devhost.lan` (or `devhost.local`, `devhost.home`) rather than plain `devhost`. Check with `nslookup devhost.lan`, and use the VM's reserved IP if no name resolves reliably.
 
 Your SSH key must load without a prompt (via ssh-agent, or no passphrase), because Docker can't answer SSH prompts.
+
+The script also offers to add a `Host` block for the VM to `~/.ssh/config`. It asks before changing an existing file, and re-running it doesn't add a second copy. If it finds a block you've edited, or your own `Host` entry for the VM, it leaves the file alone and prints the settings instead:
+
+```
+Host 192.168.1.50
+  ConnectTimeout 3          # plain ssh fails fast when the VM is down
+  ServerAliveInterval 15    # drop sessions to a VM that went away within ~45s
+  ServerAliveCountMax 3
+  ControlMaster auto        # docker calls share one SSH connection (not on Windows)
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+```
+
+Docker passes its own `-o ConnectTimeout=30` to ssh, which overrides `ConnectTimeout` from this file. A docker call to a VM that doesn't answer can therefore still take up to 30s to fail. Use the probe below to avoid that.
+
+### Use devhost only when it's reachable
+
+Avoid `docker context use devhost`. It makes devhost the default for every docker command, including the ones that IDEs, prompts and test setups run on their own. While the VM is saved, stopped or off the network, each of those commands stalls until SSH gives up, and that keeps happening until you switch the context back. Opt in per command or per session instead:
+
+```bash
+# one-off
+DOCKER_CONTEXT=devhost docker compose up -d
+docker --context devhost ps
+
+# shell rc file or .envrc (direnv): only when the daemon answers
+/path/to/devhost/client/devhost-probe.sh && export DOCKER_CONTEXT=devhost
+```
+
+```powershell
+# PowerShell profile
+if (C:\path\to\devhost\client\Test-DevHost.ps1) { $env:DOCKER_CONTEXT = 'devhost' }
+```
+
+`devhost-probe.sh [context]` runs `docker --context devhost version` and exits 0 if the daemon answers, or 1 otherwise. It never takes longer than 5s (set `DEVHOST_PROBE_TIMEOUT` to change that), even without the SSH config above.
+
+For Claude Code, a `SessionStart` hook in `.claude/settings.json` can point the session at devhost only when the VM is up. It prints a one-line note for the agent on success and nothing otherwise:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if /path/to/devhost/client/devhost-probe.sh; then echo 'export DOCKER_CONTEXT=devhost' >> \"$CLAUDE_ENV_FILE\"; echo 'devhost is reachable: docker commands in this session run on the shared devhost VM (DOCKER_CONTEXT=devhost).'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ## Using the shared host
 
@@ -119,4 +169,20 @@ Your SSH key must load without a prompt (via ssh-agent, or no passphrase), becau
 | Change memory limits | `Set-VMMemory devhost -MaximumBytes 32GB` |
 | Grow the disk | `Resize-VHD <path>.vhdx -SizeBytes 400GB`, then grow the partition and LVM in the VM |
 
-The VM starts with Windows if it was running at shutdown. Containers started with `--restart unless-stopped` come back after the VM restarts. While the VM is off or saved, developers' `docker` commands fail until it's started again.
+The VM starts with Windows if it was running at shutdown. Containers started with `--restart unless-stopped` come back after the VM restarts. While the VM is off or saved, developers' `docker` commands against devhost fail until it's started again.
+
+## Troubleshooting
+
+### Docker commands hang
+
+The `devhost` context is selected (by `DOCKER_CONTEXT=devhost` or `docker context use devhost`) while the VM is saved, stopped or unreachable. Every docker command then waits for SSH to give up (up to 30s each), and this continues until you unset the context:
+
+```bash
+unset DOCKER_CONTEXT          # PowerShell: Remove-Item Env:DOCKER_CONTEXT
+docker context use default    # if you ran `docker context use devhost`
+```
+
+Then opt in only when the VM is reachable (see [Use devhost only when it's reachable](#use-devhost-only-when-its-reachable)). Other things to check:
+
+- **Long-running commands** (`docker events`, `logs -f`, an attached `compose up`) that hang after the VM was saved need `ServerAliveInterval` in `~/.ssh/config`. Without it, SSH never notices that the VM is gone.
+- **DNS:** names like `devhost.lan` can stall when the router isn't sure about them. Point the context at the IP from the VM's reserved DHCP lease instead: `./client/add-devhost-context.sh 192.168.1.50 alice`.
