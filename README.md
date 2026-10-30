@@ -104,7 +104,7 @@ docker context use devhost       # make it the default
 
 Your SSH key must load without a prompt (via ssh-agent, or no passphrase), because Docker can't answer SSH prompts.
 
-The script also offers to add a block for the host to `~/.ssh/config` (`ControlMaster auto`, `ControlPersist 10m`, `ConnectTimeout 3`, `ServerAliveInterval 15`). Take it: every `docker` call then reuses one SSH connection, which is much faster, and a shell doesn't hang for a minute when the VM is saved.
+The script also offers to add a block for the host to `~/.ssh/config` (`ControlMaster auto`, `ControlPersist 10m`, `ConnectTimeout 3`, `ServerAliveInterval 15`). Take it: every `docker` call then reuses one SSH connection, which is much faster, and a shell doesn't hang for a minute when the VM is saved. The block goes in ahead of any `Host *` or `Match` block, because ssh uses the first value it finds for each option; if the file already has a block for the host, the script prints what it should contain instead of editing it.
 
 ## Using the shared host
 
@@ -134,6 +134,18 @@ Several `devhost run`s in the same checkout (parallel test shards, two terminals
 
 **Requirements on the laptop:** OpenSSH, the Docker CLI with the `devhost` context, and [Mutagen](https://mutagen.io) (`brew install mutagen-io/mutagen/mutagen`, or the release binary; it installs its own agent on the VM over SSH). Put `client/devhost` on your `PATH`, or symlink it. Set `DEVHOST_NO_SYNC=1` to mirror ports without syncing files (no Mutagen needed).
 
+**Configuration** (environment variables, all optional):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DEVHOST_CONTEXT` | `devhost` | Docker context to use. Set it if you gave `add-devhost-context.sh` another name. |
+| `DEVHOST_SSH` | the context's endpoint | SSH target `user@host[:port]`, if the context's isn't right. |
+| `DEVHOST_STATE_DIR` | `~/.devhost` | Where the helper keeps its socket, pid files, forwards and sessions. |
+| `DEVHOST_NO_SYNC` | unset | `1`: mirror ports only, no Mutagen. |
+| `DEVHOST_FLUSH_TIMEOUT` | `60` | Seconds to wait for a sync flush before giving up. |
+| `DEVHOST_SYNC_TIMEOUT` | `600` | Seconds to wait for a new session's initial sync. |
+| `DEVHOST_CONFLICTS` | `auto` | What a port that can't be mirrored does to `run`: `auto` fails it only for containers that started during the command, `fail` for any conflict, `warn` never. See Ports. |
+
 **Setup on the VM, once per developer:** the sync puts your checkout at the *same absolute path* on the VM, so that path prefix has to exist there and belong to you:
 
 ```bash
@@ -141,7 +153,7 @@ sudo ./guest/allow-path.sh alice /Users/alice      # macOS laptop
 sudo ./guest/allow-path.sh bob   /home/bob         # Linux laptop
 ```
 
-The script refuses if any component is owned by another developer: two laptops whose checkouts map to the same VM path must not share it. Pick a different checkout location instead.
+The script refuses if any component is owned by another developer: two laptops whose checkouts map to the same VM path must not share it. Pick a different checkout location instead. It also refuses symbolic links in the path and anything under a system directory (`/etc`, `/usr`, `/var`, ...), and never changes the owner of a directory it didn't create.
 
 ### Ports
 
@@ -198,6 +210,8 @@ Scripts then check `DEVHOST_AVAILABLE` and wrap Docker-heavy commands in `devhos
 ```bash
 make check     # shellcheck + tests (fake docker/ssh/mutagen/lsof in tests/fakes)
 ```
+
+CI runs shellcheck on Linux and the tests on both Linux and macOS, the latter with the system bash 3.2 the helper targets.
 
 ## Operating the VM (Windows host)
 
