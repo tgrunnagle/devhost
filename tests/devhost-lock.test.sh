@@ -118,11 +118,47 @@ for sig in TERM HUP; do
     pkill -f 'sleep 30' 2>/dev/null || true
 done
 
+# --- signals to the whole process group (timeout, CI cancel, closing terminal) -----
+# setsid makes devhost its own process group leader, so -$pid addresses the group.
+slow_exit="trap 'sleep 1; exit 3' TERM; sleep 30 & wait"
+setsid "$devhost" lock e2e -- sh -c "$slow_exit" &
+a=$!
+wait_held e2e
+kill -TERM -- -"$a"
+sleep 0.3
+rc=0
+"$devhost" lock e2e --no-wait -- true 2>/dev/null || rc=$?
+check "TERM to the process group keeps the lock until the command exits" test "$rc" -eq 75
+rc=0
+wait "$a" || rc=$?
+check "...and exits with the command's code" test "$rc" -eq 3
+
+timeout 1 "$devhost" lock e2e -- sh -c "$slow_exit" &
+a=$!
+sleep 1.3
+rc=0
+"$devhost" lock e2e --no-wait -- true 2>/dev/null || rc=$?
+check "timeout(1) keeps the lock until the command exits" test "$rc" -eq 75
+wait "$a" || true
+pkill -f 'sleep 30' 2>/dev/null || true
+
+# Ctrl-C: the terminal sends INT to the foreground group; devhost must not add another.
+# Background jobs start with SIGINT ignored, which shells can't undo; perl can.
+ints="$work/ints"
+count_ints="trap 'echo int >>\"$ints\"' INT; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.2; done"
+# shellcheck disable=SC2016  # perl code, not shell
+setsid perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die' "$devhost" lock e2e -- sh -c "$count_ints" &
+a=$!
+wait_held e2e
+kill -INT -- -"$a"
+wait "$a" || true
+check "Ctrl-C reaches the command once" test "$(wc -l <"$ints")" -eq 1
+
 # --- connection lost while the command runs ---------------------------------------
 "$devhost" lock e2e -- sleep 3 2>"$work/lost.err" &
 a=$!
 wait_held e2e
-pkill -f 'DEVHOST_LOCK_DIR' # the fake ssh session
+pkill -9 -f 'DEVHOST_LOCK_DIR' # the fake ssh session (it ignores TERM, like real ssh here)
 sleep 0.5
 check "warns right away when the lock's connection is lost" grep -q "lost the connection holding lock 'e2e'" "$work/lost.err"
 wait "$a" || true

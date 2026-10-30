@@ -206,13 +206,16 @@ cmd_lock() {
     remote="$(remote_bash "$LOCK_SCRIPT" "$name" "$mode" "$timeout" "$(hostname)")"
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/devhost-lock.XXXXXX")"
     mkfifo "$tmp/in" "$tmp/out"
+    # ssh shares our process group, so signals for the whole group (Ctrl-C, timeout(1),
+    # a closing terminal) would reach it too. It ignores them and ends only when its
+    # stdin closes, so the lock outlives the command's own signal handling.
     # shellcheck disable=SC2029  # $remote is quoted for the VM by remote_bash
-    ssh "${ssh_opts[@]}" "$target" "$remote" <"$tmp/in" >"$tmp/out" &
+    (trap '' INT QUIT TERM HUP; exec ssh "${ssh_opts[@]}" "$target" "$remote") <"$tmp/in" >"$tmp/out" &
     ssh_pid=$!
     exec 8>"$tmp/in" 7<"$tmp/out"
     rm -rf "$tmp"
     # On an early exit (Ctrl-C while waiting), stop SSH so the VM stops waiting too.
-    trap 'exec 8>&- 7<&-; kill "$ssh_pid" 2>/dev/null || true' EXIT
+    trap 'exec 8>&- 7<&-; kill -KILL "$ssh_pid" 2>/dev/null || true' EXIT
 
     if ! IFS= read -r line <&7 || [[ "$line" != ACQUIRED ]]; then
         exec 8>&- 7<&-
@@ -223,22 +226,25 @@ cmd_lock() {
         die "could not take lock '$name' (ssh exited with $rc)"
     fi
 
-    # Run the command as a child we wait on, so INT, TERM or HUP sent to this script
-    # reach the command and the lock is held until it has exited. Background children
-    # start with SIGINT ignored and stdin from /dev/null; undo both.
+    # Run the command as a child we wait on, and hold the lock until it has exited.
+    # Background children start with SIGINT ignored and stdin from /dev/null; undo both.
     (trap - INT QUIT; exec "$@") 0<&0 7<&- 8>&- &
     cmd_pid=$!
     # ssh prints nothing after ACQUIRED, so EOF on its stdout means the session (and
     # with it the lock) is gone. Say so right away, not when the command finishes.
     (
-        trap 'exit 0' TERM
+        trap '' TERM HUP
+        trap 'exit 0' USR1
         IFS= read -r _ <&7 || true
         echo "$prog: warning: lost the connection holding lock '$name'; the VM has" \
             "released it, and others can take it while your command still runs." >&2
     ) 0</dev/null 8>&- &
     watch_pid=$!
     exec 7<&-
-    for sig in INT TERM HUP; do
+    # Ctrl-C and Ctrl-\ reach the command from the terminal, so only keep waiting.
+    # TERM and HUP may have been sent to this script alone (kill <pid>), so pass them on.
+    trap ':' INT QUIT
+    for sig in TERM HUP; do
         # shellcheck disable=SC2064  # bind $sig now
         trap "kill -$sig \"\$cmd_pid\" 2>/dev/null || true" "$sig"
     done
@@ -250,9 +256,14 @@ cmd_lock() {
         wait "$cmd_pid" || rc=$?
         kill -0 "$cmd_pid" 2>/dev/null || break
     done
-    trap - INT TERM HUP
+    # If the command exited between an interrupted wait and kill -0, rc is 128+N from
+    # the signal; collect its real status (127: already collected above).
+    local final=0
+    wait "$cmd_pid" 2>/dev/null || final=$?
+    [[ $final -eq 127 ]] || rc=$final
+    trap - INT QUIT TERM HUP
 
-    kill "$watch_pid" 2>/dev/null || true
+    kill -USR1 "$watch_pid" 2>/dev/null || true
     wait "$watch_pid" 2>/dev/null || true
     exec 8>&-
     trap - EXIT
