@@ -15,6 +15,7 @@ Developers run `docker`, `docker build` and `docker compose` from their own lapt
 | Path | Runs on | Purpose |
 |---|---|---|
 | `host/New-DevHostVM.ps1` | Windows host (admin) | Creates the External switch and the VM |
+| `host/Register-StayAwakeTask.ps1` | Windows host (admin) | Keeps the host awake while the VM runs |
 | `config.example.psd1` | Windows host | Template for per-machine settings |
 | `guest/install-docker.sh` | VM | Installs and configures Docker Engine |
 | `guest/add-dev-user.sh` | VM | Gives a developer SSH + Docker access |
@@ -120,3 +121,16 @@ Your SSH key must load without a prompt (via ssh-agent, or no passphrase), becau
 | Grow the disk | `Resize-VHD <path>.vhdx -SizeBytes 400GB`, then grow the partition and LVM in the VM |
 
 The VM starts with Windows if it was running at shutdown. Containers started with `--restart unless-stopped` come back after the VM restarts. While the VM is off or saved, developers' `docker` commands fail until it's started again.
+
+### Keep the host awake while the VM runs
+
+Windows doesn't count a running VM as activity, so the host still goes to sleep on its idle timer and the VM freezes with it. Install a startup task that prevents sleep only while the VM is running:
+
+```powershell
+.\host\Register-StayAwakeTask.ps1               # elevated; starts immediately, no reboot
+.\host\Register-StayAwakeTask.ps1 -Unregister   # remove it
+```
+
+The task runs `stay-awake.ps1` as SYSTEM from `%ProgramData%\devhost` and checks the VM every minute. While the VM is stopped, saved or paused, your normal power plan applies. The display still turns off as usual, and choosing **Sleep** from the Start menu still works (taking the VM offline with it).
+
+To confirm it's working, run `powercfg /requests` in an elevated prompt: under **SYSTEM** you should see `Hyper-V VM 'devhost' is running`. Transitions are logged to `%ProgramData%\devhost\stay-awake.log`.
