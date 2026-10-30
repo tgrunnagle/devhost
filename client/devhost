@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# Client-side helper for devhost (macOS / Linux).
+#
+# Usage:
+#   devhost lock <name> [--wait | --no-wait] [--timeout SECS] -- <cmd> [args...]
+#   devhost lock --list
+#
+# lock: runs <cmd> on this laptop while holding a lock named <name> on the devhost VM,
+# so host-wide work (an E2E gate, an image rebuild) runs one at a time across every
+# laptop that uses the VM. The lock is a flock(1) held by an SSH session that stays open
+# while <cmd> runs; when the session ends for any reason (the command finishes, this
+# script is killed, the laptop sleeps or drops off the network) the kernel releases it.
+#
+#   --wait          wait for the lock if someone else holds it (default)
+#   --no-wait       fail right away if the lock is held
+#   --timeout SECS  wait at most SECS seconds
+#
+# Exits with <cmd>'s exit code, or 75 if the lock couldn't be taken (held with
+# --no-wait, or --timeout expired), or 1/2 for connection and usage errors.
+#
+# lock --list: shows who holds each lock (SSH user, laptop hostname, start time).
+#
+# The VM is found through the devhost Docker context (see add-devhost-context.sh).
+# Override with DEVHOST_CONTEXT=<context name> or DEVHOST_SSH=<user@host>.
+set -euo pipefail
+
+prog="devhost"
+EX_LOCKED=75
+
+# The keepalives end the session (and so release any lock it holds) within ~40s of
+# the VM going away; the VM's sshd drops a vanished laptop on the same schedule (see
+# guest/install-docker.sh). ControlPath=none keeps lock sessions off any shared
+# master connection, so each lock lives and dies with its own session.
+ssh_opts=(
+    -T
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o ControlPath=none
+)
+
+usage() {
+    cat >&2 <<EOF
+Usage: $prog lock <name> [--wait | --no-wait] [--timeout SECS] -- <cmd> [args...]
+       $prog lock --list
+EOF
+    exit 2
+}
+
+die() {
+    echo "$prog: $*" >&2
+    exit 1
+}
+
+# Quotes a word for the remote login shell (any POSIX shell).
+shquote() {
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+# Prints the SSH destination of the devhost VM.
+ssh_target() {
+    if [[ -n "${DEVHOST_SSH:-}" ]]; then
+        echo "$DEVHOST_SSH"
+        return
+    fi
+    local ctx="${DEVHOST_CONTEXT:-devhost}" host
+    if ! host="$(docker context inspect "$ctx" --format '{{.Endpoints.docker.Host}}' 2>/dev/null)"; then
+        die "no Docker context '$ctx'. Run client/add-devhost-context.sh, or set DEVHOST_SSH=user@host."
+    fi
+    if [[ "$host" != ssh://* ]]; then
+        die "Docker context '$ctx' doesn't use SSH ($host). Set DEVHOST_SSH=user@host."
+    fi
+    # OpenSSH accepts ssh://user@host[:port] destinations as-is.
+    echo "$host"
+}
+
+# Prints a remote command line that runs a bash script with the given arguments.
+remote_bash() {
+    local cmd arg
+    cmd="bash -c $(shquote "$1") devhost"
+    shift
+    for arg in "$@"; do
+        cmd+=" $(shquote "$arg")"
+    done
+    echo "$cmd"
+}
+
+# Remote side of `lock`. Args: <name> <wait|nowait> <timeout or ""> <laptop hostname>.
+# Prints ACQUIRED once the lock is held, then holds it until stdin closes.
+read -r -d '' LOCK_SCRIPT <<'EOF' || true
+set -u
+dir="${DEVHOST_LOCK_DIR:-/run/lock/devhost}"
+name="$1" mode="$2" timeout="$3" client="$4"
+lock="$dir/$name.lock" info="$dir/$name.holder"
+
+if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then
+    echo "devhost lock: $dir is missing or not writable for $(id -un) on $(hostname)." >&2
+    echo "Is $(id -un) in the devhost group? (guest/add-dev-user.sh)" >&2
+    exit 1
+fi
+umask 002
+{ exec 9>>"$lock"; } 2>/dev/null || exec 9<"$lock" || exit 1
+
+holder() {
+    local user host started pid
+    if IFS=$'\t' read -r user host started pid <"$info" 2>/dev/null; then
+        echo "$user@$host since $started"
+    else
+        echo "unknown"
+    fi
+}
+
+if ! flock -n 9; then
+    if [ "$mode" = nowait ]; then
+        echo "devhost lock: '$name' is held by $(holder)" >&2
+        exit 75
+    fi
+    echo "devhost lock: waiting for '$name' (held by $(holder))..." >&2
+    # Wait in short slices so we notice the laptop going away: sshd doesn't signal
+    # a non-tty session when it disconnects, it only closes our stdin. The laptop
+    # never writes to stdin, so "readable" means EOF.
+    while ! flock -w 1 9; do
+        if read -r -t 0; then
+            exit 1
+        fi
+        if [ -n "$timeout" ] && [ "$SECONDS" -ge "$timeout" ]; then
+            echo "devhost lock: timed out after ${timeout}s waiting for '$name'" >&2
+            exit 75
+        fi
+    done
+fi
+
+# Remove the holder record before the lock is released (fd 9 closes on exit).
+trap 'rm -f "$info"' EXIT
+trap 'exit 129' HUP
+trap 'exit 141' PIPE
+trap 'exit 143' TERM
+printf '%s\t%s\t%s\t%s\n' "$(id -un)" "$client" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" >"$info.$$"
+mv -f "$info.$$" "$info"
+echo ACQUIRED
+cat >/dev/null 9<&-
+EOF
+
+# Remote side of `lock --list`. Skips holder records whose shell is gone (only
+# possible if it was SIGKILLed on the VM; the lock itself was released then).
+read -r -d '' LIST_SCRIPT <<'EOF' || true
+set -u
+dir="${DEVHOST_LOCK_DIR:-/run/lock/devhost}"
+cd "$dir" 2>/dev/null || { echo "devhost lock: cannot read $dir" >&2; exit 1; }
+header=1
+for f in *.holder; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r user host started pid <"$f" || continue
+    [ -d "/proc/$pid" ] || continue
+    if [ -n "$header" ]; then
+        printf '%-20s %-12s %-24s %s\n' NAME USER HOST SINCE
+        header=
+    fi
+    printf '%-20s %-12s %-24s %s\n' "${f%.holder}" "$user" "$host" "$started"
+done
+EOF
+
+cmd_lock() {
+    [[ $# -ge 1 ]] || usage
+    local target
+    if [[ "$1" == --list ]]; then
+        [[ $# -eq 1 ]] || usage
+        target="$(ssh_target)"
+        exec ssh "${ssh_opts[@]}" "$target" "$(remote_bash "$LIST_SCRIPT")"
+    fi
+
+    local name="$1" mode=wait timeout=""
+    shift
+    if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+        die "invalid lock name '$name' (use letters, digits, '.', '_' and '-')"
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --wait) mode="wait" ;;
+            --no-wait) mode=nowait ;;
+            --timeout)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--timeout needs a number of seconds"
+                timeout="$2"
+                shift
+                ;;
+            --) shift; break ;;
+            *) usage ;;
+        esac
+        shift
+    done
+    [[ $# -ge 1 ]] || usage
+    if [[ "$mode" == nowait && -n "$timeout" ]]; then
+        die "--no-wait and --timeout can't be combined"
+    fi
+    target="$(ssh_target)"
+
+    # The SSH session's stdin is a FIFO only this script holds open: closing it (or
+    # this script dying) ends the session and releases the lock. Its stdout tells us
+    # when the lock is acquired.
+    local tmp remote ssh_pid line rc ssh_rc
+    remote="$(remote_bash "$LOCK_SCRIPT" "$name" "$mode" "$timeout" "$(hostname)")"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/devhost-lock.XXXXXX")"
+    mkfifo "$tmp/in" "$tmp/out"
+    # shellcheck disable=SC2029  # $remote is quoted for the VM by remote_bash
+    ssh "${ssh_opts[@]}" "$target" "$remote" <"$tmp/in" >"$tmp/out" &
+    ssh_pid=$!
+    exec 8>"$tmp/in" 7<"$tmp/out"
+    rm -rf "$tmp"
+    # On an early exit (Ctrl-C while waiting), stop SSH so the VM stops waiting too.
+    trap 'exec 8>&- 7<&-; kill "$ssh_pid" 2>/dev/null || true' EXIT
+
+    if ! IFS= read -r line <&7 || [[ "$line" != ACQUIRED ]]; then
+        exec 8>&- 7<&-
+        trap - EXIT
+        rc=0
+        wait "$ssh_pid" || rc=$?
+        [[ $rc -eq $EX_LOCKED ]] && exit "$EX_LOCKED"
+        die "could not take lock '$name' (ssh exited with $rc)"
+    fi
+
+    rc=0
+    "$@" 7<&- 8>&- || rc=$?
+
+    exec 8>&- 7<&-
+    trap - EXIT
+    ssh_rc=0
+    wait "$ssh_pid" || ssh_rc=$?
+    if [[ $ssh_rc -ne 0 ]]; then
+        echo "$prog: warning: the connection holding lock '$name' failed while the command ran" \
+            "(ssh exited with $ssh_rc); the lock may have been released early." >&2
+    fi
+    exit "$rc"
+}
+
+[[ $# -ge 1 ]] || usage
+case "$1" in
+    lock) shift; cmd_lock "$@" ;;
+    *) usage ;;
+esac

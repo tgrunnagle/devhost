@@ -20,6 +20,8 @@ Developers run `docker`, `docker build` and `docker compose` from their own lapt
 | `guest/add-dev-user.sh` | VM | Gives a developer SSH + Docker access |
 | `client/add-devhost-context.sh` | macOS / Linux laptop | Creates the `devhost` Docker context |
 | `client/Add-DevHostContext.ps1` | Windows laptop | Same, for Windows |
+| `client/devhost` | macOS / Linux laptop | Helper commands: `devhost lock` for host-wide locks |
+| `tests/devhost-lock.test.sh` | Linux | Tests for `devhost lock` |
 
 ## Requirements
 
@@ -68,7 +70,7 @@ Copy the `guest/` scripts to the VM (e.g. `scp -r guest you@devhost:`), then:
 sudo ./guest/install-docker.sh
 ```
 
-This installs Docker Engine, Buildx and Compose from Docker's apt repository, rotates container logs (10 MB × 3 per container), raises sshd's session limits for Docker over SSH, and adds you to the `docker` group.
+This installs Docker Engine, Buildx and Compose from Docker's apt repository, rotates container logs (10 MB × 3 per container), raises sshd's session limits for Docker over SSH, sets up the `devhost` group and `/run/lock/devhost` for [host-wide locks](#host-wide-locks), and adds you to the `docker` and `devhost` groups.
 
 ## 4. Add developers (inside the VM)
 
@@ -107,6 +109,49 @@ Your SSH key must load without a prompt (via ssh-agent, or no passphrase), becau
 - **Bind mounts refer to the VM's filesystem, not your laptop.** `-v ./src:/app` mounts a folder on the VM. Bake code into images or use named volumes. `docker build` works normally; the build context is uploaded from your laptop.
 - **Firewall:** ports published by Docker bypass `ufw`, because Docker manages iptables directly. Keep the VM on a trusted network.
 - **Cleanup:** images and build cache add up on a shared host. Run `docker system prune` periodically.
+- **Locks:** a lock file your project takes on your laptop doesn't stop other laptops. See [Host-wide locks](#host-wide-locks).
+
+## Host-wide locks
+
+Projects often serialize heavy work with a lock on "the host": one E2E gate at a time, one image rebuild at a time, a single cache writer. Those locks are usually files under `/tmp` on the machine running the script. With devhost the work runs on the VM but the lock stays on each laptop, so two laptops both take "the" lock and run at once on the same VM.
+
+`client/devhost lock` takes the lock on the VM instead:
+
+```bash
+client/devhost lock e2e -- task test:e2e                 # waits if someone else holds 'e2e'
+client/devhost lock e2e --no-wait -- task test:e2e       # exits 75 right away if it's held
+client/devhost lock e2e --timeout 600 -- task test:e2e   # waits at most 10 minutes, then exits 75
+client/devhost lock --list                               # who holds what
+```
+
+```
+NAME                 USER         HOST                     SINCE
+e2e                  alice        alice-mbp                2026-10-29T14:02:11Z
+```
+
+The command runs on your laptop as usual, and `devhost lock` exits with its exit code. While it runs, an SSH session to the VM holds `flock` on `/run/lock/devhost/<name>.lock`, and the lock goes away with that session. There are no stale locks to clean up: the VM releases the lock when the command finishes, when the script is killed (even with `kill -9`), or within about 40 seconds when the laptop sleeps or loses the network.
+
+- The VM is found through the `devhost` Docker context. Set `DEVHOST_CONTEXT` to use another context, or `DEVHOST_SSH=user@host` to skip Docker.
+- Only members of the VM's `devhost` group can take or list locks; `add-dev-user.sh` adds developers to it. If your VM was set up before this existed, re-run `install-docker.sh`, then `add-dev-user.sh` for each developer.
+- Locks are host-wide across all users: the VM's CPU, memory and ports are shared no matter whose daemon or containers use them.
+- On Windows, run the helper from WSL or Git Bash.
+
+### Key locks on the daemon, not the machine
+
+In project scripts, choose the lock by **where the Docker daemon runs**, not where the script runs. If the daemon is reached over SSH, lock on its host; otherwise keep the local lock:
+
+```bash
+# Run the rest of this script under the 'e2e' lock, on whichever machine runs the daemon.
+if [ -z "${E2E_LOCKED:-}" ]; then
+    export E2E_LOCKED=1
+    case "${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}" in
+        ssh://*) exec devhost lock e2e -- "$0" "$@" ;;   # remote daemon: lock on its host
+    esac
+    exec 9>/tmp/e2e.lock && flock 9                     # local daemon: lock on this machine
+fi
+```
+
+Comparing `docker info --format '{{.Name}}'` with `hostname` also detects a remote daemon, but Docker Desktop's daemon reports `docker-desktop`, so it looks remote too. Scripts that can't use the helper can take the same lock with `ssh <host> flock /run/lock/devhost/<name>.lock <cmd>`, which runs `<cmd>` on the VM.
 
 ## Operating the VM (Windows host)
 
