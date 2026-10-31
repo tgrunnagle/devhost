@@ -55,3 +55,6 @@ usermod -aG docker "$user"
 echo "==> $user is in the docker group"
 echo
 echo "On their laptop: client/add-devhost-context.sh $(hostname) $user"
+echo "To let client/devhost sync checkouts, create their laptop path prefix here:"
+echo "  sudo ./guest/allow-path.sh $user /Users/<laptop-username>     # macOS"
+echo "  sudo ./guest/allow-path.sh $user /home/<laptop-username>      # Linux"

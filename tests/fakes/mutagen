@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Fake mutagen for tests. State in $FAKE_DIR:
+#   mutagen-sessions     names of existing sessions, one per line
+#   mutagen-alphas       lines "NAME ALPHA-PATH" for those sessions
+#   mutagen-status       text printed by `sync list <name>` (e.g. a permission problem)
+#   mutagen-flush-hang   if present, `sync flush` blocks for 30s (VM gone away)
+#   mutagen-flush-fail   if present, `sync flush` exits 1 (session has problems)
+#   mutagen-create-hang  if present, `sync create` blocks for 30s before creating
+# `list` and `terminate` accept a name or `--label-selector devhost=1` (all).
+# Every invocation is appended to $FAKE_DIR/mutagen.log.
+set -u
+echo "mutagen $*" >> "$FAKE_DIR/mutagen.log"
+sessions="$FAKE_DIR/mutagen-sessions"
+alphas="$FAKE_DIR/mutagen-alphas"
+touch "$sessions" "$alphas"
+
+[[ "${1:-}" == sync ]] || { echo "fake mutagen: unsupported: $*" >&2; exit 1; }
+sub="${2:-}"
+shift 2
+
+# Concurrent devhost processes create and terminate sessions at the same
+# time; the files are rewritten under a lock so no update is lost.
+lock() { until mkdir "$FAKE_DIR/mutagen.lock" 2>/dev/null; do sleep 0.01; done; trap 'rmdir "$FAKE_DIR/mutagen.lock"' EXIT; }
+
+# Prints one session in the shape of `mutagen sync list`.
+describe() {
+    local name="$1" alpha
+    alpha="$(awk -v n="$name" '$1 == n { sub(/^[^ ]+ /, ""); print; exit }' "$alphas")"
+    echo "--------------------------------------------------------------------------------"
+    echo "Name: $name"
+    echo "Labels: devhost: 1"
+    echo "Alpha:"
+    printf '\tURL: %s\n' "$alpha"
+    echo "Beta:"
+    printf '\tURL: alice@devhost:%s\n' "$alpha"
+    cat "$FAKE_DIR/mutagen-status" 2>/dev/null || echo "Status: Watching for changes"
+}
+
+case "$sub" in
+    create)
+        name="" pos=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --name) name="$2"; shift 2 ;;
+                --label|--sync-mode|--ignore) shift 2 ;;
+                *) pos+=("$1"); shift ;;
+            esac
+        done
+        if [[ -f "$FAKE_DIR/mutagen-create-hang" ]]; then
+            sleep 30
+        fi
+        lock
+        echo "$name" >> "$sessions"
+        echo "$name ${pos[0]:-}" >> "$alphas"
+        echo "Created session $name"
+        ;;
+    list)
+        if [[ "${1:-}" == --label-selector ]]; then
+            while read -r name; do
+                [[ -n "$name" ]] || continue
+                describe "$name"
+            done < "$sessions"
+            exit 0
+        fi
+        name="${1:-}"
+        grep -qx "$name" "$sessions" || { echo "Error: unable to locate requested sessions" >&2; exit 1; }
+        describe "$name"
+        ;;
+    flush)
+        grep -qx "${1:-}" "$sessions" || exit 1
+        if [[ -f "$FAKE_DIR/mutagen-flush-hang" ]]; then
+            sleep 30
+        fi
+        if [[ -f "$FAKE_DIR/mutagen-flush-fail" ]]; then
+            echo "Error: session has problems" >&2
+            exit 1
+        fi
+        ;;
+    terminate)
+        lock
+        if [[ "${1:-}" == --label-selector ]]; then
+            : > "$sessions"
+            : > "$alphas"
+            exit 0
+        fi
+        grep -v -x "${1:-}" "$sessions" > "$sessions.tmp" || true
+        mv "$sessions.tmp" "$sessions"
+        awk -v n="${1:-}" '$1 != n' "$alphas" > "$alphas.tmp" || true
+        mv "$alphas.tmp" "$alphas"
+        ;;
+    *)
+        echo "fake mutagen: unsupported: sync $sub $*" >&2
+        exit 1
+        ;;
+esac

@@ -17,6 +17,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# shellcheck disable=SC1091
 . /etc/os-release
 codename="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
 

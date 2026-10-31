@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Fake ssh for tests. State lives in $FAKE_DIR:
+#   master            holds the pid of the "running" control master
+#   ssh-down          if present, connections fail after 1s like a saved VM
+#   ssh-fail-ports    host ports for which `-O forward` fails (one per line)
+#   ssh-remote-fail   if present, remote commands containing this text exit 1
+#   open-forwards     -L specs currently open in the master (maintained here);
+#                     like OpenSSH, `-O cancel` fails unless the exact spec is open
+# Like OpenSSH, every -O operation fails while no master is running. A remote
+# command that starts with `docker` runs the fake docker on PATH, re-split the
+# way a remote shell would; any other remote command succeeds doing nothing.
+# Every invocation is appended to $FAKE_DIR/ssh.log.
+set -u
+echo "ssh $*" >> "$FAKE_DIR/ssh.log"
+
+ctl="" fwd="" master_flag=0 dump_config=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -O) ctl="$2"; shift 2 ;;
+        -L) fwd="$2"; shift 2 ;;
+        -M) master_flag=1; shift ;;
+        -G) dump_config=1; shift ;;
+        -o|-S|-p) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+target="${1:-}"
+
+if [[ $dump_config -eq 1 ]]; then
+    if [[ "$target" == *@* ]]; then echo "user ${target%%@*}"; else echo "user alice"; fi
+    echo "hostname ${target##*@}"
+    exit 0
+fi
+
+if [[ -n "$ctl" ]]; then
+    if [[ ! -f "$FAKE_DIR/master" ]]; then
+        echo "Control socket connect($FAKE_DIR/ssh.sock): No such file or directory" >&2
+        exit 255
+    fi
+    case "$ctl" in
+        check)
+            echo "Master running (pid=$(cat "$FAKE_DIR/master"))" >&2
+            exit 0
+            ;;
+        exit)
+            rm -f "$FAKE_DIR/master" "$FAKE_DIR/open-forwards"
+            exit 0
+            ;;
+        forward)
+            port="${fwd#127.0.0.1:}"
+            port="${port%%:*}"
+            if [[ -f "$FAKE_DIR/ssh-fail-ports" ]] && grep -qx "$port" "$FAKE_DIR/ssh-fail-ports"; then
+                echo "mux_client_forward: forwarding request failed" >&2
+                exit 255
+            fi
+            echo "$fwd" >> "$FAKE_DIR/open-forwards"
+            exit 0
+            ;;
+        cancel)
+            if [[ -f "$FAKE_DIR/open-forwards" ]] && grep -qxF "$fwd" "$FAKE_DIR/open-forwards"; then
+                grep -vxF "$fwd" "$FAKE_DIR/open-forwards" > "$FAKE_DIR/open-forwards.tmp" || true
+                mv "$FAKE_DIR/open-forwards.tmp" "$FAKE_DIR/open-forwards"
+                exit 0
+            fi
+            echo "mux_client_forward: cancel request failed: port not forwarded" >&2
+            exit 255
+            ;;
+    esac
+    exit 0
+fi
+
+if [[ -f "$FAKE_DIR/ssh-down" ]]; then
+    sleep 1
+    echo "ssh: connect to host devhost port 22: Operation timed out" >&2
+    exit 255
+fi
+
+if [[ $master_flag -eq 1 ]]; then
+    echo "$$" > "$FAKE_DIR/master"
+    exit 0
+fi
+
+# Remote command: "$1" is the target, the rest is the command.
+shift || true
+cmd="$*"
+echo "ssh-remote $cmd" >> "$FAKE_DIR/ssh.log"
+if [[ -f "$FAKE_DIR/ssh-remote-fail" ]] && [[ "$cmd" == *"$(cat "$FAKE_DIR/ssh-remote-fail")"* ]]; then
+    exit 1
+fi
+case "$cmd" in
+    docker|docker\ *)
+        eval "set -- $cmd"
+        exec "$@"
+        ;;
+esac
+exit 0
