@@ -54,7 +54,8 @@ FWD_READY_FILE="$STATE_DIR/forwarder.ready"
 FWD_STREAM_FILE="$STATE_DIR/forwarder.stream"   # exists while the event stream runs
 FWD_GEN_FILE="$STATE_DIR/forwarder.reconciled"   # counter, bumped after each reconcile
 FWD_LOG="$STATE_DIR/forwarder.log"
-SESSIONS_DIR="$STATE_DIR/sessions"         # <id>: "PWD\nMODE" (up|run); <id>.runs/<pid>
+SESSIONS_DIR="$STATE_DIR/sessions"         # <id>: "PHYSICAL\nMODE\nSYNC_PATH" (up|run); <id>.runs/<pid>; <id>.lock/
+KEPT_DIR="$STATE_DIR/kept"                 # <id>: "PHYSICAL\nSYNC_PATH" of a sync kept after a failed final flush
 
 DEFAULT_IGNORES="node_modules .git .venv target dist"
 
@@ -75,7 +76,7 @@ notify() {
 }
 
 init_state() {
-    mkdir -p "$STATE_DIR" "$SESSIONS_DIR"
+    mkdir -p "$STATE_DIR" "$SESSIONS_DIR" "$KEPT_DIR"
     chmod 0700 "$STATE_DIR"
 }
 
@@ -151,9 +152,11 @@ lock_acquire() {
 # Removes lock $1 whose holder $2 (a pid, or "" for a pid-less old lock) was
 # judged dead. Reclaimers are serialised by a guard directory, and the lock
 # is re-read under it, so a lock that changed hands meanwhile is left alone
-# and no two processes ever end up holding it.
+# and no two processes ever end up holding it. A pid-less lock has no owner
+# to compare, so its age is checked again instead: a fresh one whose pid is
+# not written yet must stay.
 reclaim_stale_lock() {
-    local dir="$1" owner="$2" guard="$1.reclaim"
+    local dir="$1" owner="$2" guard="$1.reclaim" still_stale=0
     if ! mkdir "$guard" 2>/dev/null; then
         # Another process is reclaiming. A guard older than a minute was
         # left behind by one that died doing so.
@@ -164,6 +167,13 @@ reclaim_stale_lock() {
         return 0
     fi
     if [[ "$(cat "$dir/pid" 2>/dev/null || true)" == "$owner" ]]; then
+        if [[ -n "$owner" ]]; then
+            still_stale=1
+        elif [[ -n "$(find "$dir" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+            still_stale=1
+        fi
+    fi
+    if [[ $still_stale -eq 1 ]]; then
         mv "$dir" "$guard/stale" 2>/dev/null || true
     fi
     rm -rf "$guard"
@@ -821,6 +831,24 @@ devhost_sync_alphas() {
         awk '/^Alpha:/ { a = 1; next } a && $1 == "URL:" { sub(/^[ \t]*URL: /, ""); print; a = 0 }' || true
 }
 
+# Names of every devhost sync session of this state directory.
+devhost_sync_names() {
+    mutagen sync list --label-selector "$STATE_LABEL" 2>/dev/null |
+        awk '$1 == "Name:" { print $2 }' || true
+}
+
+# The laptop path this checkout's sync uses (its "alpha"): the path as typed
+# when the sync was created, which may be another spelling of $PWD. $PWD
+# when there is no sync.
+sync_alpha() {
+    local alpha=""
+    if sync_enabled && mutagen_available; then
+        alpha="$(mutagen sync list "$(sync_name)" 2>/dev/null |
+            awk '/^Alpha:/ { a = 1; next } a && $1 == "URL:" { sub(/^[ \t]*URL: /, ""); print; exit }' || true)"
+    fi
+    echo "${alpha:-$PWD}"
+}
+
 # Two sessions over the same files would fight: refuse when another devhost
 # session already covers $PWD (a checkout that is up, run from one of its
 # subdirectories) or lies inside it. Compared as physical paths.
@@ -851,9 +879,19 @@ terminate_sync_named() {
         log "warning: mutagen sync terminate $1 failed or timed out"
 }
 
-# Terminates every sync session of this state directory (leftovers included).
-terminate_all_syncs() {
-    with_deadline "$FLUSH_TIMEOUT" mutagen sync terminate --label-selector "$STATE_LABEL" >/dev/null 2>&1 || true
+# Terminates every sync session of this state directory except the kept
+# ones (see session_stop): with no directory up or starting, the rest are
+# leftovers of crashed sessions.
+terminate_leftover_syncs() {
+    local name kept
+    kept="$(kept_sync_names)"
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        if grep -qx -- "$name" <<< "$kept"; then
+            continue
+        fi
+        terminate_sync_named "$name"
+    done < <(devhost_sync_names)
 }
 
 # Warns about files Mutagen cannot update in session $1.
@@ -910,6 +948,10 @@ start_sync() {
     if sync_exists; then
         return 0
     fi
+    if sync_kept; then
+        log "warning: the sync session kept by the last 'devhost down' here is gone (mutagen lost it);"
+        log "outputs still on the VM are replaced by the laptop's files"
+    fi
     ensure_remote_dir || return 1
     check_no_overlapping_sync || return 1
     while read -r pattern; do
@@ -929,17 +971,26 @@ start_sync() {
         log "initial sync of $PWD did not finish within ${SYNC_TIMEOUT}s (DEVHOST_SYNC_TIMEOUT)"
         terminate_sync_named "$name"
         return 1
+    elif [[ $rc -ne 0 ]] && ! sync_exists; then
+        log "the sync session for $PWD disappeared during its initial sync"
+        return 1
     fi
     warn_sync_problems "$name"
 }
 
 # Waits for the sync to settle. Returns 124 on timeout, non-zero on failure,
-# after saying why; the caller decides whether that is fatal.
+# after saying why; the caller decides whether that is fatal. A session that
+# is up must have its sync: one that has gone (mutagen restarted, a sweep
+# elsewhere) is a failure, not "nothing to flush".
 flush_sync() {
     local name rc=0
     sync_enabled || return 0
     name="$(sync_name)"
-    sync_exists || return 0
+    if ! sync_exists; then
+        session_registered || return 0
+        log "the sync session for $PWD is gone (mutagen lost it?); 'devhost down' and 'devhost up' again"
+        return 1
+    fi
     with_deadline "$FLUSH_TIMEOUT" mutagen sync flush "$name" >/dev/null 2>&1 || rc=$?
     if [[ $rc -eq 124 ]]; then
         log "sync flush did not finish within ${FLUSH_TIMEOUT}s (DEVHOST_FLUSH_TIMEOUT)"
@@ -961,7 +1012,10 @@ stop_sync() {
 # A directory is "up" while sessions/<id> exists. Its MODE is "up" for an
 # explicit `devhost up` (stays until `down`) or "run" when the first `run`
 # started it (torn down when the last concurrent run finishes). Every active
-# run registers its pid under sessions/<id>.runs/.
+# run registers its pid under sessions/<id>.runs/. sessions/<id>.lock is
+# held while the directory is being brought up (its sync is being created).
+# kept/<id> marks a sync left in place because the final flush of a `down`
+# failed (see session_stop).
 
 session_id() { printf '%s' "$(phys_pwd)" | cksum | cut -d' ' -f1; }
 session_file() { echo "$SESSIONS_DIR/$(session_id)"; }
@@ -969,8 +1023,48 @@ session_lock() { echo "$SESSIONS_DIR/$(session_id).lock"; }
 runs_dir() { echo "$SESSIONS_DIR/$(session_id).runs"; }
 session_registered() { [[ -f "$(session_file)" ]]; }
 session_mode() { sed -n '2p' "$(session_file)" 2>/dev/null || true; }
-register_session() { printf '%s\n%s\n' "$(phys_pwd)" "$1" > "$(session_file)"; }
+session_alpha() { sed -n '3p' "$(session_file)" 2>/dev/null || true; }
 unregister_session() { rm -rf "$(session_file)" "$(runs_dir)"; }
+
+# Registers $PWD in mode $1. The path the sync uses is recorded with it (the
+# sync's own alpha when one exists, else $PWD) and kept across mode changes.
+register_session() {
+    local alpha
+    alpha="$(session_alpha)"
+    [[ -n "$alpha" ]] || alpha="$(sync_alpha)"
+    printf '%s\n%s\n%s\n' "$(phys_pwd)" "$1" "$alpha" > "$(session_file)"
+}
+
+# A checkout brought up through another spelling of its path (a symlink)
+# has its files on the VM at that spelling: a command run from here that
+# mounts $PWD finds nothing there.
+warn_if_other_spelling() {
+    local alpha
+    sync_enabled || return 0
+    alpha="$(session_alpha)"
+    [[ -n "$alpha" && "$alpha" != "$PWD" ]] || return 0
+    log "warning: $PWD is up as $alpha: the VM has its files at $alpha, so a mount of $PWD"
+    log "finds nothing there. Run the command from $alpha, or 'devhost down' there and start it here."
+}
+
+kept_file() { echo "$KEPT_DIR/$(session_id)"; }
+sync_kept() { [[ -f "$(kept_file)" ]]; }
+mark_sync_kept() {
+    local alpha
+    alpha="$(session_alpha)"
+    [[ -n "$alpha" ]] || alpha="$(sync_alpha)"
+    printf '%s\n%s\n' "$(phys_pwd)" "$alpha" > "$(kept_file)"
+}
+unmark_sync_kept() { rm -f "$(kept_file)"; }
+
+# Names of the kept syncs: not leftovers, whatever else is running.
+kept_sync_names() {
+    local f
+    for f in "$KEPT_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        sync_name_for "$(sed -n '1p' "$f")"
+    done
+}
 
 register_run() { mkdir -p "$(runs_dir)"; echo "$$" > "$(runs_dir)/$$"; }
 unregister_run() { rm -f "$(runs_dir)/$$"; }
@@ -1027,13 +1121,32 @@ prune_sessions() {
     done
 }
 
-# True if any directory is still up.
+# True if a directory is up, or is being brought up by another process (a
+# held <id>.lock): its sync is being created and must not be swept as a
+# leftover, nor the master pulled from under it. Our own lock does not
+# count: abandon_session holds it while undoing an interrupted start.
 sessions_remaining() {
     local f
     for f in "$SESSIONS_DIR"/*; do
         [[ -f "$f" ]] && return 0
     done
+    for f in "$SESSIONS_DIR"/*.lock; do
+        session_starting_in "$f" && return 0
+    done
     return 1
+}
+
+# True if lock directory $1 is held by a live process other than this one.
+session_starting_in() {
+    local pid
+    [[ -d "$1" ]] || return 1
+    pid="$(cat "$1/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]]; then
+        [[ "$pid" != "$$" ]] && pid_alive "$pid"
+    else
+        # Just made; its pid is not written yet. Older than that: abandoned.
+        [[ -z "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]]
+    fi
 }
 
 runs_alive_in() {
@@ -1092,6 +1205,7 @@ session_start() {
     else
         register_session "$mode"
     fi
+    unmark_sync_kept               # a kept sync is this session's again
     lock_release "$(session_lock)"
     STARTED_MODE="$mode"
     log "up: forwarding published ports to 127.0.0.1; $(sync_enabled && echo "syncing $PWD" || echo "sync disabled")"
@@ -1101,14 +1215,15 @@ session_start() {
 
 # Stops the session for $PWD; the forwarder and master go when no directory
 # is left. Caller holds the lock. If the final flush fails, the sync session
-# is kept: terminating it would let the next session's priming delete
-# outputs on the VM that never reached the laptop.
+# is kept and marked as such: terminating it would let the next session's
+# priming delete outputs on the VM that never reached the laptop, and the
+# mark keeps the sweep below (from a `down` elsewhere) off it.
 session_stop() {
-    local keep_sync=0
     if flush_sync; then
         stop_sync
-    else
-        keep_sync=1
+        unmark_sync_kept
+    elif sync_enabled && sync_exists; then
+        mark_sync_kept
         log "warning: keeping the sync session for $PWD so outputs on the VM are not lost;"
         log "run 'devhost flush' or 'devhost down' here once the VM answers again"
     fi
@@ -1118,9 +1233,9 @@ session_stop() {
         stop_forwarder
         stop_master
         rm -f "$FORWARDS_FILE" "$CONFLICTS_FILE"
-        # No directory is up, so any devhost sync Mutagen still has is a leftover.
-        if [[ $keep_sync -eq 0 ]] && sync_enabled && mutagen_available; then
-            terminate_all_syncs
+        # No directory is up or starting: what Mutagen still has is a leftover.
+        if sync_enabled && mutagen_available; then
+            terminate_leftover_syncs
         fi
     fi
 }
@@ -1166,6 +1281,7 @@ cmd_up() {
             register_session up    # a running `run` started it; keep it after that run ends
         fi
         log "$PWD is already up"
+        warn_if_other_spelling
     else
         UP_STARTING=1
         session_start up || exit 1
@@ -1205,7 +1321,17 @@ cmd_flush() {
     check_conflict_mode
     init_state
     resolve_target
-    session_registered || die "$PWD is not up (run: devhost up)"
+    if ! session_registered; then
+        sync_kept || die "$PWD is not up (run: devhost up)"
+        # The last `down` here could not flush and kept the sync: finish it.
+        trap 'lock_release "$(session_lock)"' EXIT
+        lock_acquire "$(session_lock)"
+        flush_sync || die "flush failed: outputs on the VM may not have reached the laptop; the sync session stays"
+        stop_sync
+        unmark_sync_kept
+        log "flushed; the sync session kept by the last 'devhost down' is closed"
+        return 0
+    fi
     if sync_enabled && ! sync_exists; then
         die "no sync session for $PWD (mutagen lost it?); run 'devhost down' and 'devhost up' again"
     fi
@@ -1328,6 +1454,7 @@ cmd_run() {
     lock_acquire
     if session_active; then
         RUN_MODE="$(session_mode)"
+        warn_if_other_spelling
     else
         mode="${STALE_MODE:-run}"     # a stale `up` session comes back as `up`
         RUN_STARTING=1
@@ -1401,9 +1528,17 @@ cmd_status() {
             [[ -f "$f" ]] || continue
             echo "  $(sed -n '1p' "$f") ($(sed -n '2p' "$f"))"
         done
+        for f in "$SESSIONS_DIR"/*.lock; do
+            session_starting_in "$f" || continue
+            echo "  (a directory is being brought up by pid $(cat "$f/pid" 2>/dev/null || echo '?'))"
+        done
     else
         echo "up in:      no directories"
     fi
+    for f in "$KEPT_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        echo "kept sync:  $(sed -n '2p' "$f") (its last 'down' could not flush; run 'devhost flush' there)"
+    done
     if sync_enabled && mutagen_available; then
         if sync_exists; then
             echo "sync ($PWD):"

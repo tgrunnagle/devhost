@@ -18,6 +18,10 @@ touch "$sessions" "$alphas"
 sub="${2:-}"
 shift 2
 
+# Concurrent devhost processes create and terminate sessions at the same
+# time; the files are rewritten under a lock so no update is lost.
+lock() { until mkdir "$FAKE_DIR/mutagen.lock" 2>/dev/null; do sleep 0.01; done; trap 'rmdir "$FAKE_DIR/mutagen.lock"' EXIT; }
+
 # Prints one session in the shape of `mutagen sync list`.
 describe() {
     local name="$1" alpha
@@ -45,6 +49,7 @@ case "$sub" in
         if [[ -f "$FAKE_DIR/mutagen-create-hang" ]]; then
             sleep 30
         fi
+        lock
         echo "$name" >> "$sessions"
         echo "$name ${pos[0]:-}" >> "$alphas"
         echo "Created session $name"
@@ -72,6 +77,7 @@ case "$sub" in
         fi
         ;;
     terminate)
+        lock
         if [[ "${1:-}" == --label-selector ]]; then
             : > "$sessions"
             : > "$alphas"

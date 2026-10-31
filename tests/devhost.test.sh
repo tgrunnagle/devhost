@@ -462,6 +462,23 @@ run_devhost() { "$DEVHOST" "$@"; }
 # (not a wrapper subshell) and signals sent to $! reach it.
 start_devhost() { "$DEVHOST" "$@" 2>/dev/null & }
 
+exited() { ! kill -0 "$1" 2>/dev/null; }
+
+# Waits up to $1 seconds for background pid $2 and returns its exit status.
+# A process still running after that is killed (with its process group) and
+# the test fails, instead of hanging the suite.
+wait_exit() {
+    local secs="$1" pid="$2"
+    wait_for "$secs" "pid $pid to exit" exited "$pid" || {
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 1
+    }
+    wait "$pid"
+}
+
 test_run_passes_exit_code_and_sets_context() {
     printf 'abc123def456 redis\n' > "$FAKE_DIR/ps"
     echo "6379/tcp -> 127.0.0.1:6379" > "$FAKE_DIR/port.abc123def456"
@@ -624,7 +641,7 @@ test_group_term_reaches_command() {
     set +m
     wait_for 30 "the command to start" test -e "$FAKE_DIR/child-started"
     kill -TERM -- "-$pid"
-    wait "$pid" || rc=$?
+    wait_exit 30 "$pid" || rc=$?
     assert_exists "$FAKE_DIR/child-got-term" "TERM reached the command"
     assert_eq "$rc" "7" "exit code is the command's, not the signal's"
     assert_missing "$FAKE_DIR/master" "torn down after the signal"
@@ -798,7 +815,8 @@ test_last_down_terminates_leftover_syncs() {
     status="$(run_devhost status 2>/dev/null)"
     [[ "$status" == *"other devhost syncs"*"$TMP/old-checkout"* ]] || fail "status lists other devhost syncs: $status"
     run_devhost down 2>/dev/null || fail "down"
-    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate --label-selector $(state_label)" "leftovers of this state dir go with the last session"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync list --label-selector $(state_label)" "only this state dir's sessions are considered"
+    assert_file_has "$FAKE_DIR/mutagen.log" "sync terminate devhost-leftover" "leftovers of this state dir go with the last session"
     assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "no devhost sync left"
 }
 
@@ -902,7 +920,7 @@ test_ctrl_c_reaches_command() {
     set +m
     wait_for 30 "the command to start" test -e "$FAKE_DIR/child-started"
     kill -INT -- "-$pid"
-    wait "$pid" || rc=$?
+    wait_exit 30 "$pid" || rc=$?
     assert_exists "$FAKE_DIR/child-got-int" "Ctrl-C reached the command"
     assert_eq "$rc" "5" "exit code is the command's"
     assert_missing "$FAKE_DIR/master" "torn down"
@@ -1023,6 +1041,103 @@ test_initial_sync_does_not_hold_the_global_lock() {
     wait "$pid" || rc=$?
     assert_eq "$rc" "1" "the stuck up fails on its timeout"
     assert_missing "$FAKE_DIR/master" "everything torn down"
+}
+
+test_kept_sync_survives_a_down_elsewhere() {
+    : > "$FAKE_DIR/ps"
+    local name rc=0 out
+    name="devhost-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    mkdir -p "$TMP/other"
+    # shellcheck disable=SC2016
+    DEVHOST_FLUSH_TIMEOUT=1 run_devhost run -- sh -c 'touch "$FAKE_DIR/mutagen-flush-hang"' 2>/dev/null || fail "run"
+    rm -f "$FAKE_DIR/mutagen-flush-hang"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "$name" "sync kept after the failed final flush"
+    (cd "$TMP/other" && run_devhost up 2>/dev/null && run_devhost down 2>/dev/null) || fail "up/down elsewhere"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "$name" "the last down elsewhere sweeps leftovers, not the kept sync"
+    out="$(run_devhost status 2>/dev/null)"
+    [[ "$out" == *"kept sync:  $PWD"* ]] || fail "status shows the kept sync: $out"
+    out="$(run_devhost flush 2>&1)" || rc=$?
+    assert_eq "$rc" "0" "flush here finishes the earlier down: $out"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "the sync is closed once its outputs are flushed"
+    assert_eq "$(ls "$DEVHOST_STATE_DIR/kept")" "" "no longer marked kept"
+    rc=0
+    run_devhost flush 2>/dev/null || rc=$?
+    assert_eq "$rc" "1" "nothing left to flush: not up"
+}
+
+test_down_elsewhere_leaves_a_starting_session_alone() {
+    : > "$FAKE_DIR/ps"
+    touch "$FAKE_DIR/mutagen-flush-hang"
+    mkdir -p "$TMP/other"
+    local pid rc=0 name
+    name="devhost-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    DEVHOST_SYNC_TIMEOUT=20 start_devhost up           # stuck priming its sync, not registered yet
+    pid=$!
+    wait_for 30 "the up to reach its priming flush" grep -q "sync flush $name-prime" "$FAKE_DIR/mutagen.log"
+    (cd "$TMP/other" && DEVHOST_NO_SYNC=1 run_devhost up 2>/dev/null && DEVHOST_NO_SYNC=1 run_devhost down 2>/dev/null) || fail "up/down elsewhere"
+    assert_file_has "$FAKE_DIR/mutagen-sessions" "$name-prime" "the last down elsewhere did not sweep the sync being created"
+    assert_exists "$FAKE_DIR/master" "nor stop the master under the starting session"
+    kill -TERM "$pid"
+    wait_exit 30 "$pid" || rc=$?
+    assert_eq "$rc" "143" "the up exits on the signal"
+    assert_missing "$FAKE_DIR/master" "then everything is torn down"
+    assert_eq "$(cat "$FAKE_DIR/mutagen-sessions")" "" "including the sync"
+}
+
+test_flush_sync_fails_when_an_up_sessions_sync_is_gone() {
+    load
+    register_session up
+    local rc=0
+    flush_sync 2>/dev/null || rc=$?
+    assert_eq "$rc" "1" "a session that is up must have its sync"
+    unregister_session
+    flush_sync 2>/dev/null || fail "nothing up: nothing to flush"
+}
+
+test_sync_lost_during_run_is_reported() {
+    : > "$FAKE_DIR/ps"
+    local out rc=0
+    # shellcheck disable=SC2016
+    out="$(run_devhost run -- sh -c ': > "$FAKE_DIR/mutagen-sessions"; : > "$FAKE_DIR/mutagen-alphas"' 2>&1)" || rc=$?
+    assert_eq "$rc" "0" "the command's exit code wins: $out"
+    [[ "$out" == *"sync session for $PWD is gone"* ]] || fail "the lost sync is reported, not passed off as flushed: $out"
+    assert_eq "$(ls "$DEVHOST_STATE_DIR/kept")" "" "nothing kept: there is no sync to keep"
+    assert_missing "$FAKE_DIR/master" "torn down"
+}
+
+test_fresh_pidless_lock_is_not_reclaimed() {
+    load
+    mkdir -p "$LOCK_DIR"                               # just made, pid not written yet
+    reclaim_stale_lock "$LOCK_DIR" ""
+    assert_exists "$LOCK_DIR" "a fresh pid-less lock is left alone"
+    touch -t 202001010000 "$LOCK_DIR"
+    reclaim_stale_lock "$LOCK_DIR" ""
+    assert_missing "$LOCK_DIR" "an old one is reclaimed"
+}
+
+test_warns_when_up_under_another_spelling() {
+    load
+    printf '%s\n%s\n%s\n' "$(pwd -P)" up "$TMP/link" > "$(session_file)"
+    local out
+    out="$(warn_if_other_spelling 2>&1)"
+    [[ "$out" == *"$PWD is up as $TMP/link"* ]] || fail "warns about the other spelling: $out"
+    printf '%s\n%s\n%s\n' "$(pwd -P)" up "$PWD" > "$(session_file)"
+    assert_eq "$(warn_if_other_spelling 2>&1)" "" "no warning for the spelling that is up"
+}
+
+test_run_from_another_spelling_warns() {
+    if ! ln -s "$PROJECT" "$TMP/link" 2>/dev/null || [[ ! -L "$TMP/link" ]]; then
+        echo "       (no symlinks on this filesystem; skipped)"
+        return 0
+    fi
+    : > "$FAKE_DIR/ps"
+    local out
+    (cd "$TMP/link" && run_devhost up 2>/dev/null) || fail "up through the link"
+    out="$(run_devhost run -- true 2>&1)" || fail "run from the physical path: $out"
+    [[ "$out" == *"$PROJECT is up as $TMP/link"* ]] || fail "warns that the VM has the files at the link path: $out"
+    out="$(cd "$TMP/link" && run_devhost run -- true 2>&1)" || fail "run through the link: $out"
+    [[ "$out" != *"is up as"* ]] || fail "no warning from the spelling that is up: $out"
+    run_devhost down 2>/dev/null || fail "down"
 }
 
 test_add_devhost_context_inserts_ssh_block() {
